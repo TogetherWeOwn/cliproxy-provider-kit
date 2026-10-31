@@ -24,11 +24,13 @@ const QuotaHTTPTimeout = 15 * time.Second
 type QuotaHTTPClient struct{ client *http.Client }
 
 // NewQuotaHTTPClient sets a 15s timeout, no redirects and a 1MiB response cap.
-// With nil transport it uses a clone of the standard transport (including normal
-// environment proxy behavior), not a mutable shared http.Client.
+// With nil transport it uses a clone of the standard transport whose proxy is
+// QuotaProxy: the WithProxyURL setting, else normal environment proxy behavior.
 func NewQuotaHTTPClient(transport http.RoundTripper) *QuotaHTTPClient {
 	if transport == nil {
-		transport = http.DefaultTransport.(*http.Transport).Clone()
+		t := http.DefaultTransport.(*http.Transport).Clone()
+		t.Proxy = QuotaProxy
+		transport = t
 	}
 	return &QuotaHTTPClient{client: &http.Client{Transport: transport, Timeout: QuotaHTTPTimeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 }
@@ -42,6 +44,12 @@ func (c *QuotaHTTPClient) Do(ctx context.Context, r pluginapi.HTTPRequest) (plug
 	}
 	if r.Method != "" && r.Method != http.MethodGet {
 		return pluginapi.HTTPResponse{}, rpcError("invalid_request", "quota HTTP helper only supports GET", 400)
+	}
+	// Fail closed: never fall back to a direct connection for a bad proxy setting.
+	if raw, ok := ctx.Value(proxyContextKey{}).(string); ok {
+		if _, _, err := parseProxy(raw); err != nil {
+			return pluginapi.HTTPResponse{}, rpcError("invalid_proxy", "invalid quota proxy setting", 400)
+		}
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.URL, bytes.NewReader(r.Body))
 	if err != nil {

@@ -136,7 +136,8 @@ func (q *CachedQuota) FetchQuota(ctx context.Context, r pluginapi.QuotaFetchRequ
 			return
 		}
 		var out pluginapi.QuotaFetchResponse
-		out, e.err = q.fetch(ctx, r)
+		// Route direct polls like host requests: auth proxy, then global proxy.
+		out, e.err = q.fetch(WithProxyURL(ctx, AuthProxyURL(r.StorageJSON, r.Metadata, r.Host.ProxyURL)), r)
 		if e.err == nil {
 			e.raw, e.err = json.Marshal(out)
 			if e.err != nil {
