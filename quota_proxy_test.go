@@ -50,6 +50,7 @@ func TestAuthProxyURLPrecedence(t *testing.T) {
 		{"metadata wins", `{"proxy_url":"http://storage:1"}`, map[string]any{"proxy_url": " http://meta:1 "}, "http://host:1", "http://meta:1"},
 		{"storage before host", `{"proxy_url":"http://storage:1"}`, nil, "http://host:1", "http://storage:1"},
 		{"host fallback", `{}`, map[string]any{"proxy_url": " "}, " http://host:1 ", "http://host:1"},
+		{"cleared metadata hides storage", `{"proxy_url":"http://storage:1"}`, map[string]any{"proxy_url": ""}, "http://host:1", "http://host:1"},
 		{"explicit direct", `{}`, map[string]any{"proxy_url": "direct"}, "http://host:1", "direct"},
 		{"unreadable storage", `not json`, nil, "http://host:1", "http://host:1"},
 		{"inherit", `{}`, nil, "", ""},

@@ -15,13 +15,15 @@ type proxyContextKey struct{}
 // (metadata overrides storage), then the host's global proxy-url. An empty
 // result means "inherit": the environment proxy settings apply.
 func AuthProxyURL(storage []byte, metadata map[string]any, hostProxyURL string) string {
-	if value, ok := metadata["proxy_url"].(string); ok && strings.TrimSpace(value) != "" {
-		return strings.TrimSpace(value)
-	}
-	if fields, err := object(storage); err == nil {
-		if value, ok := fields["proxy_url"].(string); ok && strings.TrimSpace(value) != "" {
-			return strings.TrimSpace(value)
+	value, present := metadata["proxy_url"]
+	if !present {
+		if fields, err := object(storage); err == nil {
+			value = fields["proxy_url"]
 		}
+	}
+	// A present metadata value, even an empty one, hides the storage value.
+	if text, _ := value.(string); strings.TrimSpace(text) != "" {
+		return strings.TrimSpace(text)
 	}
 	return strings.TrimSpace(hostProxyURL)
 }
