@@ -66,7 +66,7 @@ Use [`examples/echo/main.go`](examples/echo/main.go) for a complete executable e
 | `RetryAfterSeconds(header, now) int` | Parse HTTP seconds/date retry guidance without a hidden clock. |
 | `NewCachedQuota(provider, display, FetchQuotaFunc) *CachedQuota` | Non-resettable SDK `QuotaProvider`; successful per-auth cache for `QuotaCacheTTL` = 60 seconds, coalesced concurrent fetches, copy isolation. |
 | `CachedQuota.Store(request, response) error` / `Invalidate(authID)` | Incorporate provider quota headers by auth identity, or invalidate header observations and all polled credential versions for an auth. |
-| `NewQuotaHTTPClient(http.RoundTripper) *QuotaHTTPClient` | Read-only polling, 15-second total timeout, 1 MiB body cap, no redirects, redacted errors; `CloseIdleConnections` for teardown. The default transport honors `WithProxyURL`. |
+| `NewQuotaHTTPClient(http.RoundTripper) *QuotaHTTPClient` | Read-only polling, 15-second total timeout, 1 MiB body cap, no redirects, redacted errors; `CloseIdleConnections` for teardown. The default transport, `NewQuotaTransport()`, honors `WithProxyURL` and speaks HTTP/1.1 so pooled connections never cross proxies. |
 | `AuthProxyURL(storage, metadata, hostProxyURL)` / `WithProxyURL(ctx, proxy)` / `QuotaProxy` | Resolve the auth's `proxy_url`, else the host's global `proxy-url`, attach it to a direct request context, or use it as a custom transport's `Proxy` func. |
 | `NewHostHTTPClient(Caller, callbackID) pluginapi.HostHTTPClient` | Scoped callback adapter, normally injected by Runtime. Never retain it beyond its request/stream. |
 | `Caller` / `CallerFunc` | Raw concurrent host callback boundary; useful for isolated contract tests. |

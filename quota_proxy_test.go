@@ -3,10 +3,13 @@ package providerkit
 import (
 	"context"
 	"errors"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
@@ -122,5 +125,53 @@ func TestQuotaHTTPInvalidProxyFailsClosed(t *testing.T) {
 	}
 	if direct != 0 {
 		t.Fatal("invalid proxy fell back to a direct connection")
+	}
+}
+
+// connectProxy is a minimal HTTPS (CONNECT) forward proxy that counts tunnels.
+func connectProxy(t *testing.T) (*httptest.Server, *atomic.Int32) {
+	var tunnels atomic.Int32
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect {
+			http.Error(w, "CONNECT only", http.StatusMethodNotAllowed)
+			return
+		}
+		upstream, err := net.Dial("tcp", r.Host)
+		if err != nil {
+			http.Error(w, "dial failed", http.StatusBadGateway)
+			return
+		}
+		tunnels.Add(1)
+		client, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			upstream.Close()
+			return
+		}
+		client.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
+		go func() { io.Copy(upstream, client); upstream.Close() }()
+		go func() { io.Copy(client, upstream); client.Close() }()
+	}))
+	t.Cleanup(s.Close)
+	return s, &tunnels
+}
+
+func TestQuotaHTTPConnectionsDoNotCrossProxies(t *testing.T) {
+	upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`{}`)) }))
+	upstream.EnableHTTP2 = true
+	upstream.StartTLS()
+	defer upstream.Close()
+	proxyA, tunnelsA := connectProxy(t)
+	proxyB, tunnelsB := connectProxy(t)
+	transport := NewQuotaTransport()
+	transport.TLSClientConfig = upstream.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+	c := NewQuotaHTTPClient(transport)
+	defer c.CloseIdleConnections()
+	for _, proxy := range []string{proxyA.URL, proxyB.URL} {
+		if _, err := c.Do(WithProxyURL(context.Background(), proxy), pluginapi.HTTPRequest{URL: upstream.URL}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if tunnelsA.Load() != 1 || tunnelsB.Load() != 1 {
+		t.Fatalf("tunnels A=%d B=%d; the second poll reused the first proxy's connection", tunnelsA.Load(), tunnelsB.Load())
 	}
 }
