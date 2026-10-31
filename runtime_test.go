@@ -245,3 +245,152 @@ func TestAsyncStreamEmitsAndCloses(t *testing.T) {
 		t.Fatalf("methods %v error %+v", methods, detail)
 	}
 }
+
+type schedulerStub struct{ pluginapi.Scheduler }
+
+func TestNewRejectsUnsafeDefinitions(t *testing.T) {
+	executor := &testExecutor{}
+	for name, c := range map[string]pluginapi.Capabilities{
+		"executor without input formats":  {Executor: executor, ExecutorOutputFormats: []string{"openai"}},
+		"executor without output formats": {Executor: executor, ExecutorInputFormats: []string{"openai"}},
+		"invalid model scope":             {Executor: executor, ExecutorInputFormats: []string{"openai"}, ExecutorOutputFormats: []string{"openai"}, ExecutorModelScope: "everything"},
+		// Advertising a capability the runtime never dispatches would leave host calls unanswered.
+		"undispatched capability": {Scheduler: schedulerStub{}},
+	} {
+		if _, err := New(Definition{Metadata: metadata(), Capabilities: c}, nil); err == nil {
+			t.Fatalf("%s accepted", name)
+		}
+	}
+	for _, repo := range []string{"http://github.com/example/echo", "https://user@github.com/example/echo", "https://github.com/example/echo?x=1", "https://github.com/example/echo#readme", "https://github.com/example", "https://github.com/example/echo/tree"} {
+		m := metadata()
+		m.GitHubRepository = repo
+		if err := ValidateMetadata(m); err == nil {
+			t.Fatalf("accepted repository %q", repo)
+		}
+	}
+}
+func TestRegistrationAdvertisesOnlyConfiguredCapabilities(t *testing.T) {
+	r := newRuntime(t, Definition{Metadata: metadata(), Capabilities: pluginapi.Capabilities{Executor: &testExecutor{}, ExecutorInputFormats: []string{"openai"}, ExecutorOutputFormats: []string{"claude"}}}, nil)
+	env := rpc(t, r, "plugin.register", map[string]any{"schema_version": 9})
+	if !env.OK {
+		t.Fatal(env.Error)
+	}
+	var reg struct {
+		Capabilities map[string]any `json:"capabilities"`
+	}
+	if err := json.Unmarshal(env.Result, &reg); err != nil {
+		t.Fatal(err)
+	}
+	c := reg.Capabilities
+	if c["executor"] != true || c["executor_model_scope"] != string(pluginapi.ExecutorModelScopeBoth) || c["auth_provider"] != false || c["quota_provider"] != false || c["usage_plugin"] != false {
+		t.Fatalf("capabilities %v", c)
+	}
+	if in, _ := json.Marshal(c["executor_input_formats"]); string(in) != `["openai"]` {
+		t.Fatalf("input formats %s", in)
+	}
+}
+func TestRuntimeThreadsHostCallbackScope(t *testing.T) {
+	var scopes []string
+	h := CallerFunc(func(_ context.Context, m string, raw []byte) ([]byte, error) {
+		var req struct {
+			Scope string `json:"host_callback_id"`
+		}
+		json.Unmarshal(raw, &req)
+		scopes = append(scopes, m+"="+req.Scope)
+		switch m {
+		case "host.http.operation_open":
+			return []byte(`{"ok":true,"result":{"operation_id":"op"}}`), nil
+		case "host.http.do":
+			return []byte(`{"ok":true,"result":{"StatusCode":200}}`), nil
+		}
+		return []byte(`{"ok":true,"result":{}}`), nil
+	})
+	r := newRuntime(t, Definition{Metadata: metadata(), Capabilities: pluginapi.Capabilities{Executor: echoExecutor(), ExecutorInputFormats: []string{"openai"}, ExecutorOutputFormats: []string{"openai"}}}, h)
+	register(t, r)
+	// The callback ID scopes host-side credentials; losing it would run the request unscoped.
+	if env := rpc(t, r, "executor.http_request", map[string]any{"Method": "GET", "URL": "https://example.com", "host_callback_id": "scope-9"}); !env.OK {
+		t.Fatal(env.Error)
+	}
+	if len(scopes) != 3 || scopes[0] != "host.http.operation_open=scope-9" || scopes[1] != "host.http.do=scope-9" || scopes[2] != "host.http.cancel=scope-9" {
+		t.Fatalf("scopes %q", scopes)
+	}
+}
+func TestStreamDispatchRejectsInvalidSetup(t *testing.T) {
+	ok := CallerFunc(func(context.Context, string, []byte) ([]byte, error) { return []byte(`{"ok":true,"result":{}}`), nil })
+	caps := func(e pluginapi.ProviderExecutor) pluginapi.Capabilities {
+		return pluginapi.Capabilities{Executor: e, ExecutorInputFormats: []string{"openai"}, ExecutorOutputFormats: []string{"openai"}}
+	}
+	for name, tc := range map[string]struct {
+		host Caller
+		exec pluginapi.ProviderExecutor
+		req  map[string]any
+		code string
+	}{
+		"no stream id":        {ok, &testExecutor{chunks: make(chan pluginapi.ExecutorStreamChunk)}, map[string]any{}, "invalid_request"},
+		"no host bridge":      {nil, &testExecutor{chunks: make(chan pluginapi.ExecutorStreamChunk)}, map[string]any{"stream_id": "s"}, "invalid_request"},
+		"nil executor stream": {ok, &testExecutor{}, map[string]any{"stream_id": "s"}, "invalid_stream"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newRuntime(t, Definition{Metadata: metadata(), Capabilities: caps(tc.exec)}, tc.host)
+			register(t, r)
+			if env := rpc(t, r, "executor.execute_stream", tc.req); env.OK || env.Error.Code != tc.code {
+				t.Fatalf("env %+v", env)
+			}
+			// A rejected stream must not leave work registered, or quiesce would hang.
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				if env := rpc(t, r, "plugin.quiesce", nil); !env.OK {
+					t.Errorf("quiesce: %+v", env)
+				}
+			}()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("rejected stream left work in flight")
+			}
+		})
+	}
+}
+func TestStreamEmitFailureClosesWithError(t *testing.T) {
+	chunks := make(chan pluginapi.ExecutorStreamChunk, 4)
+	var mu sync.Mutex
+	var emits int
+	var detail *pluginabi.Error
+	closed := make(chan struct{})
+	h := CallerFunc(func(_ context.Context, m string, raw []byte) ([]byte, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch m {
+		case "host.stream.emit":
+			emits++
+			return []byte(`{"ok":false,"error":{"code":"client_gone","message":"client disconnected"}}`), nil
+		case "host.stream.close":
+			var req struct {
+				Detail *pluginabi.Error `json:"error_detail"`
+			}
+			json.Unmarshal(raw, &req)
+			detail = req.Detail
+			close(closed)
+		}
+		return []byte(`{"ok":true,"result":{}}`), nil
+	})
+	r := newRuntime(t, Definition{Metadata: metadata(), Capabilities: pluginapi.Capabilities{Executor: &testExecutor{chunks: chunks}, ExecutorInputFormats: []string{"openai"}, ExecutorOutputFormats: []string{"openai"}}}, h)
+	register(t, r)
+	chunks <- pluginapi.ExecutorStreamChunk{}
+	chunks <- pluginapi.ExecutorStreamChunk{Payload: []byte("one")}
+	chunks <- pluginapi.ExecutorStreamChunk{Payload: []byte("two")}
+	if env := rpc(t, r, "executor.execute_stream", map[string]any{"stream_id": "s"}); !env.OK {
+		t.Fatal(env.Error)
+	}
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("stream not closed after emit failure")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if emits != 1 || detail == nil || detail.Code != "host_error" {
+		t.Fatalf("emits %d detail %+v", emits, detail)
+	}
+}

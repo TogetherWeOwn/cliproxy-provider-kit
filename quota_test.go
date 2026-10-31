@@ -277,3 +277,175 @@ func TestQuotaHTTPTransportErrorRedactionAndCancellation(t *testing.T) {
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestQuotaIdentityIsRequiredAndScoped(t *testing.T) {
+	var calls int
+	fetch := func(context.Context, pluginapi.QuotaFetchRequest) (pluginapi.QuotaFetchResponse, error) {
+		calls++
+		return quotaFixture(.5), nil
+	}
+	q := NewCachedQuota("echo", "Echo", fetch)
+	for name, r := range map[string]pluginapi.QuotaFetchRequest{
+		"no identity":    {Provider: "echo"},
+		"other provider": {AuthID: "a", Provider: "other"},
+	} {
+		if _, err := q.FetchQuota(context.Background(), r); MapError(err).Code != "invalid_auth" {
+			t.Fatalf("%s: fetch %v", name, err)
+		}
+		if err := q.Store(r, quotaFixture(.9)); MapError(err).Code != "invalid_auth" {
+			t.Fatalf("%s: store %v", name, err)
+		}
+	}
+	if _, err := NewCachedQuota("", "Echo", fetch).FetchQuota(context.Background(), pluginapi.QuotaFetchRequest{AuthID: "a"}); err == nil {
+		t.Fatal("unnamed quota provider served a fetch")
+	}
+	if calls != 0 {
+		t.Fatalf("rejected requests reached the provider: %d", calls)
+	}
+	// A rejected cross-provider Store must not poison this provider's account.
+	if resp, err := q.FetchQuota(context.Background(), pluginapi.QuotaFetchRequest{AuthID: "a", Provider: "echo"}); err != nil || resp.Groups[0].Buckets[0].RemainingFraction != .5 || calls != 1 {
+		t.Fatalf("cross-provider observation leaked: %+v calls %d %v", resp, calls, err)
+	}
+	// AuthIndex identifies the account when AuthID is absent, for both observations and invalidation.
+	if err := q.Store(pluginapi.QuotaFetchRequest{AuthIndex: "index-b"}, quotaFixture(.9)); err != nil {
+		t.Fatal(err)
+	}
+	byIndex := pluginapi.QuotaFetchRequest{AuthIndex: "index-b", Provider: "echo"}
+	if resp, err := q.FetchQuota(context.Background(), byIndex); err != nil || resp.Groups[0].Buckets[0].RemainingFraction != .9 || calls != 1 {
+		t.Fatalf("index observation missed: %+v calls %d %v", resp, calls, err)
+	}
+	q.Invalidate("index-b")
+	if resp, err := q.FetchQuota(context.Background(), byIndex); err != nil || resp.Groups[0].Buckets[0].RemainingFraction != .5 || calls != 2 {
+		t.Fatalf("index invalidation failed: %+v calls %d %v", resp, calls, err)
+	}
+}
+
+func TestQuotaCancellation(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	var attempts, calls atomic.Int32
+	q := NewCachedQuota("echo", "Echo", func(ctx context.Context, _ pluginapi.QuotaFetchRequest) (pluginapi.QuotaFetchResponse, error) {
+		attempts.Add(1)
+		if err := ctx.Err(); err != nil {
+			return pluginapi.QuotaFetchResponse{}, err
+		}
+		if calls.Add(1) == 1 {
+			close(started)
+			<-release
+		}
+		return quotaFixture(.5), nil
+	})
+	req := pluginapi.QuotaFetchRequest{AuthID: "a", Provider: "echo"}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := q.FetchQuota(canceled, req); !errors.Is(err, context.Canceled) || attempts.Load() != 0 {
+		t.Fatalf("canceled fetch %v reached the provider %d times", err, attempts.Load())
+	}
+	leader := make(chan error, 1)
+	go func() { _, err := q.FetchQuota(context.Background(), req); leader <- err }()
+	<-started
+	// A waiter on another caller's in-flight poll must still honor its own context.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	waiter := make(chan error, 1)
+	go func() { _, err := q.FetchQuota(ctx, req); waiter <- err }()
+	select {
+	case err := <-waiter:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("waiter %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waiter ignored its context while another poll was in flight")
+	}
+	close(release)
+	if err := <-leader; err != nil || calls.Load() != 1 {
+		t.Fatalf("leader %v calls %d", err, calls.Load())
+	}
+}
+
+func TestQuotaPanicAndMissingFetchAreNotCached(t *testing.T) {
+	var calls int
+	q := NewCachedQuota("echo", "Echo", func(context.Context, pluginapi.QuotaFetchRequest) (pluginapi.QuotaFetchResponse, error) {
+		calls++
+		if calls == 1 {
+			panic("example-key")
+		}
+		return quotaFixture(.5), nil
+	})
+	req := pluginapi.QuotaFetchRequest{AuthID: "a", Provider: "echo"}
+	_, err := q.FetchQuota(context.Background(), req)
+	if e := MapError(err); e.Code != "plugin_panic" || strings.Contains(e.Message, "example-key") {
+		t.Fatalf("panic %+v", e)
+	}
+	if resp, err := q.FetchQuota(context.Background(), req); err != nil || resp.Groups[0].Buckets[0].RemainingFraction != .5 || calls != 2 {
+		t.Fatalf("panic result cached: %+v calls %d %v", resp, calls, err)
+	}
+	_, err = NewCachedQuota("echo", "Echo", nil).FetchQuota(context.Background(), req)
+	if e := MapError(err); e.Code != "unsupported_method" || e.HTTPStatus != 501 {
+		t.Fatalf("nil fetch %+v", e)
+	}
+}
+
+func TestQuotaHTTPMethodAndStatusClassification(t *testing.T) {
+	var hits atomic.Int32
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		switch r.URL.Path {
+		case "/headers":
+			if r.Method != http.MethodGet || r.Header.Get("Authorization") != "Bearer example-key" {
+				w.WriteHeader(400)
+			}
+		case "/limited":
+			w.Header().Set("Retry-After", "7")
+			w.WriteHeader(429)
+		case "/down":
+			w.WriteHeader(503)
+		case "/forbidden":
+			w.WriteHeader(403)
+		case "/redirect":
+			w.Header().Set("Retry-After", "9")
+			http.Redirect(w, r, "/target", 307)
+		case "/exact":
+			w.Write([]byte(strings.Repeat("x", 1<<20)))
+		}
+	}))
+	defer s.Close()
+	c := NewQuotaHTTPClient(nil)
+	defer c.CloseIdleConnections()
+	// The helper is read-only so it can never become an inference or mutation path.
+	for _, method := range []string{http.MethodPost, http.MethodDelete, "get"} {
+		_, err := c.Do(context.Background(), pluginapi.HTTPRequest{Method: method, URL: s.URL + "/headers", Body: []byte(`{}`)})
+		if e := MapError(err); e.Code != "invalid_request" || e.HTTPStatus != 400 {
+			t.Fatalf("%s accepted: %+v", method, e)
+		}
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("rejected method reached the endpoint %d times", hits.Load())
+	}
+	if resp, err := c.Do(context.Background(), pluginapi.HTTPRequest{Method: http.MethodGet, URL: s.URL + "/headers", Headers: http.Header{"Authorization": {"Bearer example-key"}}}); err != nil || resp.StatusCode != 200 {
+		t.Fatalf("headers %+v %v", resp, err)
+	}
+	for _, tc := range []struct {
+		path      string
+		code      string
+		status    int
+		retryable bool
+		after     int
+	}{
+		{"/limited", "quota_http_error", 429, true, 7},
+		{"/down", "quota_http_error", 503, true, 0},
+		{"/forbidden", "quota_http_error", 403, false, 0},
+		{"/redirect", "quota_redirect", 502, false, 9},
+	} {
+		_, err := c.Do(context.Background(), pluginapi.HTTPRequest{URL: s.URL + tc.path})
+		e := MapError(err)
+		if e.Code != tc.code || e.HTTPStatus != tc.status || e.Retryable != tc.retryable || e.RetryAfterSeconds != tc.after {
+			t.Fatalf("%s mapped %+v", tc.path, e)
+		}
+	}
+	if resp, err := c.Do(context.Background(), pluginapi.HTTPRequest{URL: s.URL + "/exact"}); err != nil || len(resp.Body) != 1<<20 {
+		t.Fatalf("1 MiB body rejected: %d %v", len(resp.Body), err)
+	}
+	if _, err := c.Do(context.Background(), pluginapi.HTTPRequest{URL: "://example-key"}); err == nil || strings.Contains(err.Error(), "example-key") {
+		t.Fatalf("invalid URL %v", err)
+	}
+}
