@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 permissions:
@@ -15,10 +16,10 @@ jobs:
       CGO_ENABLED: '1'
       GOTOOLCHAIN: local
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.26.10'
           cache-dependency-path: |
@@ -28,7 +29,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test -z "$(gofmt -l $(git ls-files '*.go'))"
+          test -z "$(git ls-files -z '*.go' | xargs -0 -r gofmt -l)"
       - name: Verify pinned modules
         run: |
           go mod verify
@@ -43,6 +44,10 @@ jobs:
         run: go build -trimpath -buildmode=c-shared -o "${RUNNER_TEMP}/echo.so" ./examples/echo
       - name: Real v8.0.48 host-loader compatibility
         run: go -C integration/hostcompat test -race -count=1 -v ./...
+      - name: Known-vulnerability scan
+        run: |
+          go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+          go -C integration/hostcompat run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
       - name: Install secret scanner
         run: go install github.com/zricethezav/gitleaks/v8@v8.24.3
       - name: Secret scan
