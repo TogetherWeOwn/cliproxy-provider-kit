@@ -1,0 +1,6 @@
+# Build outputs belong in a temporary directory, not in the public source tree.
+*.so
+*.dylib
+*.dll
+*.test
+coverage.out
