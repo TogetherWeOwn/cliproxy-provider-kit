@@ -66,7 +66,8 @@ Use [`examples/echo/main.go`](examples/echo/main.go) for a complete executable e
 | `RetryAfterSeconds(header, now) int` | Parse HTTP seconds/date retry guidance without a hidden clock. |
 | `NewCachedQuota(provider, display, FetchQuotaFunc) *CachedQuota` | Non-resettable SDK `QuotaProvider`; successful per-auth cache for `QuotaCacheTTL` = 60 seconds, coalesced concurrent fetches, copy isolation. |
 | `CachedQuota.Store(request, response) error` / `Invalidate(authID)` | Incorporate provider quota headers by auth identity, or invalidate header observations and all polled credential versions for an auth. |
-| `NewQuotaHTTPClient(http.RoundTripper) *QuotaHTTPClient` | Read-only polling, 15-second total timeout, 1 MiB body cap, no redirects, redacted errors; `CloseIdleConnections` for teardown. |
+| `NewQuotaHTTPClient(http.RoundTripper) *QuotaHTTPClient` | Read-only polling, 15-second total timeout, 1 MiB body cap, no redirects, redacted errors; `CloseIdleConnections` for teardown. The default transport honors `WithProxyURL`. |
+| `AuthProxyURL(storage, metadata, hostProxyURL)` / `WithProxyURL(ctx, proxy)` / `QuotaProxy` | Resolve the auth's `proxy_url`, else the host's global `proxy-url`, attach it to a direct request context, or use it as a custom transport's `Proxy` func. |
 | `NewHostHTTPClient(Caller, callbackID) pluginapi.HostHTTPClient` | Scoped callback adapter, normally injected by Runtime. Never retain it beyond its request/stream. |
 | `Caller` / `CallerFunc` | Raw concurrent host callback boundary; useful for isolated contract tests. |
 
@@ -106,6 +107,8 @@ Default `CountTokens` is an explicitly marked estimate (ceil of Unicode payload 
 ### Quota polling and cache
 
 `FetchQuotaFunc` fetches and parses the provider's official quota format, returning normalized SDK groups/buckets/summary/subscription. The kit does not invent plan limits, reset support, or dollars. Errors are not cached and stale observations are not silently returned. Polled results are keyed by provider, auth identity, and a hash of storage/metadata/attributes, preventing credential changes from reusing old **polled** quota. Header observations are a separate auth-identity tier, preferred while fresh. Both tiers expire after 60 seconds and are pruned on fetch; the cache is in-process and starts empty after reload.
+
+Direct polls follow the host's proxy precedence. `CachedQuota` passes `FetchQuotaFunc` a context carrying the auth's `proxy_url` (else `Host.ProxyURL`), and `QuotaHTTPClient` sends the request through it: `http`, `https`, `socks5` or `socks5h`, with `direct`/`none` bypassing proxies and an empty setting inheriting the environment. An invalid setting fails the request instead of connecting directly. Other direct calls, such as per-auth model discovery, should wrap their context with `WithProxyURL(ctx, AuthProxyURL(...))`.
 
 A provider `UsagePlugin` can normalize a quota response header and call `CachedQuota.Store` using only the identity from `pluginapi.UsageRecord`:
 
