@@ -61,7 +61,8 @@ func parseProxy(raw string) (*url.URL, bool, error) {
 
 // QuotaProxy is an http.Transport Proxy function that applies the setting from
 // WithProxyURL and otherwise falls back to the environment. Custom transports
-// passed to NewQuotaHTTPClient should use it to honor per-auth proxies.
+// should start from NewQuotaTransport rather than set it alone: a transport
+// shared across proxies must not reuse HTTP/2 connections.
 func QuotaProxy(r *http.Request) (*url.URL, error) {
 	raw, ok := r.Context().Value(proxyContextKey{}).(string)
 	if !ok {

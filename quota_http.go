@@ -23,14 +23,24 @@ const QuotaHTTPTimeout = 15 * time.Second
 // method must NOT follow redirects itself (the standard transports do not).
 type QuotaHTTPClient struct{ client *http.Client }
 
+// NewQuotaTransport clones the standard transport with QuotaProxy as its proxy
+// (the WithProxyURL setting, else normal environment proxy behavior). It speaks
+// HTTP/1.1 only: Go reuses a cached HTTP/2 connection by destination before it
+// consults Proxy, so one auth's poll could ride another auth's proxy. HTTP/1.1
+// connections are pooled per proxy.
+func NewQuotaTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.Proxy = QuotaProxy
+	t.Protocols = new(http.Protocols)
+	t.Protocols.SetHTTP1(true)
+	return t
+}
+
 // NewQuotaHTTPClient sets a 15s timeout, no redirects and a 1MiB response cap.
-// With nil transport it uses a clone of the standard transport whose proxy is
-// QuotaProxy: the WithProxyURL setting, else normal environment proxy behavior.
+// With nil transport it uses NewQuotaTransport.
 func NewQuotaHTTPClient(transport http.RoundTripper) *QuotaHTTPClient {
 	if transport == nil {
-		t := http.DefaultTransport.(*http.Transport).Clone()
-		t.Proxy = QuotaProxy
-		transport = t
+		transport = NewQuotaTransport()
 	}
 	return &QuotaHTTPClient{client: &http.Client{Transport: transport, Timeout: QuotaHTTPTimeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 }
