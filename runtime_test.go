@@ -338,7 +338,12 @@ func TestStreamDispatchRejectsInvalidSetup(t *testing.T) {
 			}
 			// A rejected stream must not leave work registered, or quiesce would hang.
 			done := make(chan struct{})
-			go func() { rpc(t, r, "plugin.quiesce", nil); close(done) }()
+			go func() {
+				defer close(done)
+				if env := rpc(t, r, "plugin.quiesce", nil); !env.OK {
+					t.Errorf("quiesce: %+v", env)
+				}
+			}()
 			select {
 			case <-done:
 			case <-time.After(time.Second):

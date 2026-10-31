@@ -84,7 +84,7 @@ func TestAuthParserProviderScopeAndNormalization(t *testing.T) {
 		t.Fatalf("unnamed parser claimed untyped file: %+v %v", resp, err)
 	}
 	p := APIKeyAuth{Provider: "echo"}
-	if resp, err := p.ParseAuth(ctx, pluginapi.AuthParseRequest{Provider: "echo", RawJSON: raw}); err != nil || !resp.Handled {
+	if resp, err := p.ParseAuth(ctx, pluginapi.AuthParseRequest{Provider: "echo", RawJSON: raw}); err != nil || !resp.Handled || resp.Auth.Provider != "echo" {
 		t.Fatalf("scoped parse %+v %v", resp, err)
 	}
 	// Surrounding whitespace must neither reach upstream nor fork the account identity.
