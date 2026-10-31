@@ -65,7 +65,7 @@ Use [`examples/echo/main.go`](examples/echo/main.go) for a complete executable e
 | `MapError(error) *pluginabi.Error` | Preserve explicit code/status/retry fields; redact unclassified errors. |
 | `RetryAfterSeconds(header, now) int` | Parse HTTP seconds/date retry guidance without a hidden clock. |
 | `NewCachedQuota(provider, display, FetchQuotaFunc) *CachedQuota` | Non-resettable SDK `QuotaProvider`; successful per-auth cache for `QuotaCacheTTL` = 60 seconds, coalesced concurrent fetches, copy isolation. |
-| `CachedQuota.Store(request, response) error` / `Invalidate(authID)` | Incorporate provider quota headers or invalidate all credential versions for an auth. |
+| `CachedQuota.Store(request, response) error` / `Invalidate(authID)` | Incorporate provider quota headers by auth identity, or invalidate header observations and all polled credential versions for an auth. |
 | `NewQuotaHTTPClient(http.RoundTripper) *QuotaHTTPClient` | Read-only polling, 15-second total timeout, 1 MiB body cap, no redirects, redacted errors; `CloseIdleConnections` for teardown. |
 | `NewHostHTTPClient(Caller, callbackID) pluginapi.HostHTTPClient` | Scoped callback adapter, normally injected by Runtime. Never retain it beyond its request/stream. |
 | `Caller` / `CallerFunc` | Raw concurrent host callback boundary; useful for isolated contract tests. |
@@ -105,9 +105,17 @@ Default `CountTokens` is an explicitly marked estimate (ceil of Unicode payload 
 
 ### Quota polling and cache
 
-`FetchQuotaFunc` fetches and parses the provider's official quota format, returning normalized SDK groups/buckets/summary/subscription. The kit does not invent plan limits, reset support, or dollars. Errors are not cached and stale observations are not silently returned. Cache keys include provider, auth identity, and a hash of storage/metadata/attributes, preventing credential changes from reusing old quota. Expired entries are pruned on fetch; the cache is in-process and starts empty after reload.
+`FetchQuotaFunc` fetches and parses the provider's official quota format, returning normalized SDK groups/buckets/summary/subscription. The kit does not invent plan limits, reset support, or dollars. Errors are not cached and stale observations are not silently returned. Polled results are keyed by provider, auth identity, and a hash of storage/metadata/attributes, preventing credential changes from reusing old **polled** quota. Header observations are a separate auth-identity tier, preferred while fresh. Both tiers expire after 60 seconds and are pruned on fetch; the cache is in-process and starts empty after reload.
 
-A provider `UsagePlugin` can normalize a quota response header and call `CachedQuota.Store` with the same credential context used by `FetchQuota`. An older in-flight poll cannot overwrite the stored observation. Use one cache instance for both interfaces. Recreate/invalidate the cache when configuration changes endpoint or quota semantics.
+A provider `UsagePlugin` can normalize a quota response header and call `CachedQuota.Store` using only the identity from `pluginapi.UsageRecord`:
+
+```go
+err := cache.Store(pluginapi.QuotaFetchRequest{
+    AuthID: record.AuthID, AuthIndex: record.AuthIndex, Provider: record.Provider,
+}, normalizedQuota)
+```
+
+`Store` and `FetchQuota` use `AuthID`, falling back to `AuthIndex` only when `AuthID` is absent. Supply `AuthID` whenever available in the usage record so it matches the host-enriched fetch. `Store` does not need or key on storage/metadata/attributes: the host may supply physical auth-file bytes and additional metadata only on `FetchQuota`. An older in-flight poll cannot overwrite the stored header observation. Use one cache instance for both interfaces. Invalidate an identity when reusing it for a different credential (header observations cannot detect credential changes), and recreate/invalidate the cache when configuration changes endpoint or quota semantics.
 
 **Transport distinction:** v8.0.48's `HostHTTPClient` follows redirects, without a per-request flag to prohibit them or cap reads. Therefore the strict polling helper is separate: `QuotaHTTPClient.Do` allows GET only, uses a 15-second total timeout, never follows redirects, caps successful bodies at 1 MiB, and discards error bodies/URL/transport text. Pass a configured `http.RoundTripper` when deployment proxy policy requires it; nil clones the standard transport (normal environment proxies). This helper is **not** for inference. If using the host client for quota instead, the host's redirect semantics apply and strict no-redirect polling is not guaranteed. Neither helper logs keys; host request logging remains controlled by the host operator.
 

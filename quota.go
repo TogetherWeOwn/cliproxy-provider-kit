@@ -20,13 +20,15 @@ type FetchQuotaFunc func(context.Context, pluginapi.QuotaFetchRequest) (pluginap
 
 // CachedQuota implements a non-resettable SDK quota provider with per-account
 // single-flight fetching, copy isolation, and a 60-second cache. Use Store to
-// incorporate normalized inference response headers without another HTTP poll.
+// incorporate normalized inference response headers by auth identity without
+// another HTTP poll or access to the host's credential context.
 type CachedQuota struct {
 	provider, display string
 	fetch             FetchQuotaFunc
 	now               func() time.Time
 	mu                sync.Mutex
 	entries           map[quotaKey]*quotaEntry
+	observations      map[string]*quotaEntry
 }
 type quotaKey struct {
 	AuthID, Provider string
@@ -42,19 +44,26 @@ type quotaEntry struct {
 // NewCachedQuota creates an empty quota cache. The identity and callback are
 // fixed for its lifetime. No background polls or provider requests are started.
 func NewCachedQuota(provider, display string, fetch FetchQuotaFunc) *CachedQuota {
-	return &CachedQuota{provider: provider, display: display, fetch: fetch, now: time.Now, entries: make(map[quotaKey]*quotaEntry)}
+	return &CachedQuota{provider: provider, display: display, fetch: fetch, now: time.Now, entries: make(map[quotaKey]*quotaEntry), observations: make(map[string]*quotaEntry)}
 }
 func (q *CachedQuota) Identifier() string { return q.provider }
 func (q *CachedQuota) DescribeQuota(context.Context, pluginapi.QuotaDescribeRequest) (pluginapi.QuotaDescribeResponse, error) {
 	return pluginapi.QuotaDescribeResponse{SupportedProviders: []string{q.provider}, DisplayName: q.display, SupportsReset: false}, nil
 }
-func (q *CachedQuota) key(r pluginapi.QuotaFetchRequest) (quotaKey, error) {
+func (q *CachedQuota) authID(r pluginapi.QuotaFetchRequest) (string, error) {
 	id := r.AuthID
 	if id == "" {
 		id = r.AuthIndex
 	}
 	if id == "" || q.provider == "" || r.Provider != "" && r.Provider != q.provider {
-		return quotaKey{}, rpcError("invalid_auth", "quota requires a matching provider and auth identity", 400)
+		return "", rpcError("invalid_auth", "quota requires a matching provider and auth identity", 400)
+	}
+	return id, nil
+}
+func (q *CachedQuota) key(r pluginapi.QuotaFetchRequest) (quotaKey, error) {
+	id, err := q.authID(r)
+	if err != nil {
+		return quotaKey{}, err
 	}
 	raw, err := json.Marshal(struct {
 		Storage    []byte
@@ -91,6 +100,17 @@ func (q *CachedQuota) FetchQuota(ctx context.Context, r pluginapi.QuotaFetchRequ
 		if !e.expires.IsZero() && !now.Before(e.expires) {
 			delete(q.entries, k)
 		}
+	}
+	for id, e := range q.observations {
+		if !now.Before(e.expires) {
+			delete(q.observations, id)
+		}
+	}
+	// Usage records carry auth identity but no credential context. Prefer their
+	// fresh header observations even when the host enriches the fetch request.
+	if e := q.observations[key.AuthID]; e != nil {
+		q.mu.Unlock()
+		return decodeQuota(e)
 	}
 	if e := q.entries[key]; e != nil {
 		q.mu.Unlock()
@@ -134,10 +154,14 @@ func (q *CachedQuota) FetchQuota(ctx context.Context, r pluginapi.QuotaFetchRequ
 	return decodeQuota(e)
 }
 
-// Store replaces an observation (for example, from a provider quota header).
-// An older in-flight poll cannot overwrite it. Data is cloned on store and read.
+// Store replaces an auth-identity observation (for example, from a provider
+// quota header). Only AuthID (or AuthIndex when AuthID is absent) and an optional
+// matching Provider are used; credential context is neither needed nor keyed.
+// Fresh observations take precedence over polls, including older in-flight
+// polls. Data is cloned on store and read. Invalidate when reusing an identity
+// for a different credential, or recreate the cache on reconfiguration.
 func (q *CachedQuota) Store(r pluginapi.QuotaFetchRequest, out pluginapi.QuotaFetchResponse) error {
-	key, err := q.key(r)
+	id, err := q.authID(r)
 	if err != nil {
 		return err
 	}
@@ -149,15 +173,17 @@ func (q *CachedQuota) Store(r pluginapi.QuotaFetchRequest, out pluginapi.QuotaFe
 	close(e.ready)
 	q.mu.Lock()
 	e.expires = q.now().Add(QuotaCacheTTL)
-	q.entries[key] = e
+	q.observations[id] = e
 	q.mu.Unlock()
 	return nil
 }
 
-// Invalidate discards all credential versions for the given auth ID.
+// Invalidate discards header observations and all polled credential versions
+// for the given auth ID (or AuthIndex when used instead of AuthID).
 func (q *CachedQuota) Invalidate(authID string) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	delete(q.observations, authID)
 	for key := range q.entries {
 		if key.AuthID == authID {
 			delete(q.entries, key)

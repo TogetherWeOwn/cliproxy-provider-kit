@@ -69,6 +69,105 @@ func TestQuotaCacheTTLPerAuthAndCopies(t *testing.T) {
 		t.Fatal("fake reset")
 	}
 }
+func TestQuotaHeaderObservationMatchesEnrichedFetch(t *testing.T) {
+	var calls int
+	q := NewCachedQuota("echo", "Echo", func(context.Context, pluginapi.QuotaFetchRequest) (pluginapi.QuotaFetchResponse, error) {
+		calls++
+		return quotaFixture(.5), nil
+	})
+	// UsagePlugin only has auth identity, not persisted storage or host metadata.
+	usage := pluginapi.UsageRecord{Provider: "echo", AuthID: "a", AuthIndex: "index-a"}
+	observation := quotaFixture(.9)
+	if err := q.Store(pluginapi.QuotaFetchRequest{AuthID: usage.AuthID, Provider: usage.Provider}, observation); err != nil {
+		t.Fatal(err)
+	}
+	observation.Groups[0].Buckets[0].RemainingFraction = 0
+	// The host reads physical file bytes and enriches FetchQuota independently.
+	req := pluginapi.QuotaFetchRequest{
+		AuthID: "a", AuthIndex: "index-a", Provider: "echo",
+		StorageJSON: []byte("{\n  \"type\": \"echo\", \"api_key\": \"example-key\", \"label\": \"Example\"\n}\n"),
+		Metadata:    map[string]any{"label": "Example"},
+		Attributes:  map[string]string{"path": "example.json"},
+	}
+	for i := 0; i < 2; i++ {
+		resp, err := q.FetchQuota(context.Background(), req)
+		if err != nil || len(resp.Groups) != 1 || resp.Groups[0].Buckets[0].RemainingFraction != .9 || calls != 0 {
+			t.Fatalf("header observation missed: response %+v, calls %d, error %v", resp, calls, err)
+		}
+		resp.Groups[0].Buckets[0].RemainingFraction = 0
+	}
+}
+
+func TestQuotaHeaderObservationTTLAndInvalidation(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	var calls int
+	q := NewCachedQuota("echo", "Echo", func(context.Context, pluginapi.QuotaFetchRequest) (pluginapi.QuotaFetchResponse, error) {
+		calls++
+		return quotaFixture(.5), nil
+	})
+	q.now = func() time.Time { return now }
+	req := pluginapi.QuotaFetchRequest{AuthID: "a", Provider: "echo", StorageJSON: []byte(`{"api_key":"example-key"}`)}
+	// A fresh header must supersede a successful, credential-keyed poll too.
+	if _, err := q.FetchQuota(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	store := func() {
+		t.Helper()
+		if err := q.Store(pluginapi.QuotaFetchRequest{AuthID: "a"}, quotaFixture(.9)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store()
+	check := func(r pluginapi.QuotaFetchRequest, want float64, wantCalls int) {
+		t.Helper()
+		resp, err := q.FetchQuota(context.Background(), r)
+		if err != nil || len(resp.Groups) != 1 || resp.Groups[0].Buckets[0].RemainingFraction != want || calls != wantCalls {
+			t.Fatalf("response %+v, calls %d (want %d), error %v", resp, calls, wantCalls, err)
+		}
+	}
+	check(req, .9, 1)
+	other := req
+	other.AuthID = "b"
+	check(other, .5, 2)
+	now = now.Add(59 * time.Second)
+	check(req, .9, 2)
+	now = now.Add(time.Second)
+	check(req, .5, 3)
+	store()
+	q.Invalidate("a")
+	check(req, .5, 4)
+}
+
+func TestQuotaHeaderObservationSurvivesOlderPoll(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	q := NewCachedQuota("echo", "Echo", func(context.Context, pluginapi.QuotaFetchRequest) (pluginapi.QuotaFetchResponse, error) {
+		calls.Add(1)
+		close(started)
+		<-release
+		return quotaFixture(.5), nil
+	})
+	req := pluginapi.QuotaFetchRequest{AuthID: "a", Provider: "echo", StorageJSON: []byte(`{"api_key":"example-key"}`), Metadata: map[string]any{"label": "Example"}}
+	done := make(chan error, 1)
+	go func() {
+		_, err := q.FetchQuota(context.Background(), req)
+		done <- err
+	}()
+	<-started
+	err := q.Store(pluginapi.QuotaFetchRequest{AuthID: "a"}, quotaFixture(.9))
+	close(release)
+	if pollErr := <-done; pollErr != nil {
+		t.Fatal(pollErr)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := q.FetchQuota(context.Background(), req)
+	if err != nil || len(resp.Groups) != 1 || resp.Groups[0].Buckets[0].RemainingFraction != .9 || calls.Load() != 1 {
+		t.Fatalf("older poll replaced header: response %+v, calls %d, error %v", resp, calls.Load(), err)
+	}
+}
+
 func TestQuotaConcurrentFetchAndHeaderUpdate(t *testing.T) {
 	var calls atomic.Int32
 	release := make(chan struct{})
