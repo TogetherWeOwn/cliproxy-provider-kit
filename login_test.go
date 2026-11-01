@@ -2,6 +2,7 @@ package providerkit
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"html"
 	"io"
@@ -399,6 +400,74 @@ func TestLoginResubmitIsIdempotent(t *testing.T) {
 	if first.Status != pluginapi.AuthLoginStatusSuccess || second.Status != pluginapi.AuthLoginStatusSuccess ||
 		first.Auth.ID != second.Auth.ID || first.Auth.FileName != second.Auth.FileName {
 		t.Fatalf("not idempotent: %+v %+v", first, second)
+	}
+}
+
+// TestLoginAbandonedSubmitReleasesOwnership proves the login-validation
+// parse is provisional (issue #13): with a provider guarding filename
+// ownership through KeyOwnership, a submitted-but-abandoned login holds its
+// key only until the session expires, after which an upload of the same key
+// under a different filename parses instead of failing as a duplicate.
+func TestLoginAbandonedSubmitReleasesOwnership(t *testing.T) {
+	guardNow := time.Now()
+	guard := &KeyOwnership{now: func() time.Time { return guardNow }}
+	base := APIKeyAuth{Provider: "echo"}
+	provisionalSeen := false
+	parse := func(ctx context.Context, req pluginapi.AuthParseRequest) (pluginapi.AuthParseResponse, error) {
+		out, err := base.ParseAuth(ctx, req)
+		if err != nil || !out.Handled {
+			return out, err
+		}
+		if _, ok := ProvisionalParseExpiry(ctx); ok {
+			provisionalSeen = true
+		}
+		key, err := APIKey(out.Auth.StorageJSON, out.Auth.Metadata)
+		if err != nil {
+			return pluginapi.AuthParseResponse{}, err
+		}
+		if err := guard.Claim(ctx, req.FileName, sha256.Sum256([]byte(key))); err != nil {
+			return pluginapi.AuthParseResponse{}, err
+		}
+		return out, nil
+	}
+	login, err := NewAPIKeyLogin(APIKeyLoginConfig{Provider: "echo", Parse: parse, SessionTTL: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := loginRuntime(t, login)
+	upload := func() error {
+		_, err := parse(context.Background(), pluginapi.AuthParseRequest{
+			Provider: "echo", FileName: "upload.json",
+			RawJSON: []byte(`{"type":"echo","api_key":"example-key"}`)})
+		return err
+	}
+
+	// Submit a key, then abandon the login (never poll).
+	start := startLogin(t, r)
+	resp := manage(t, r, pluginapi.ManagementRequest{Method: "POST", Path: loginSubmitPath,
+		Body: []byte(`{"state":"` + start.State + `","api_key":"example-key"}`)})
+	if resp.StatusCode != 200 {
+		t.Fatalf("submit %+v", resp)
+	}
+	if !provisionalSeen {
+		t.Fatal("login validation parse was not marked provisional")
+	}
+	// The in-flight login still blocks a different filename.
+	if err := upload(); err == nil || MapError(err).Code != "duplicate_auth" {
+		t.Fatalf("upload during login = %v, want duplicate_auth", err)
+	}
+	// Once the abandoned session has expired the same upload owns the key.
+	guardNow = guardNow.Add(2 * time.Minute)
+	if err := upload(); err != nil {
+		t.Fatalf("upload after abandoned session expired: %v", err)
+	}
+
+	// Submit-time duplicate feedback still works against the committed owner.
+	start = startLogin(t, r)
+	resp = manage(t, r, pluginapi.ManagementRequest{Method: "POST", Path: loginSubmitPath,
+		Body: []byte(`{"state":"` + start.State + `","api_key":"example-key"}`)})
+	if resp.StatusCode != 400 || !strings.Contains(string(resp.Body), "duplicate_auth") {
+		t.Fatalf("duplicate submit %+v", resp)
 	}
 }
 

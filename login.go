@@ -56,7 +56,10 @@ import (
 //  3. The submit handler runs the provider's full ParseAuth pipeline,
 //     including provider validation and the duplicate-key guard, against a
 //     deterministic file name derived from the key digest, so submitting the
-//     same key twice is idempotent instead of a duplicate. The validated
+//     same key twice is idempotent instead of a duplicate. That validation
+//     parse is marked provisional (ProvisionalParseExpiry), so an ownership
+//     guard reserves the key only until the session expires instead of
+//     committing it for a file the host may never save. The validated
 //     AuthData is kept in the memory-only session; PollLogin delivers it to
 //     exactly one poller, then keeps a credential-free tombstone until expiry
 //     so a concurrent second poller waits instead of failing the host login.
@@ -108,7 +111,10 @@ type APIKeyLoginConfig struct {
 	// loginProviderPattern).
 	Provider string
 	// Parse is the provider's full ParseAuth pipeline, including validation
-	// and the duplicate-key guard.
+	// and the duplicate-key guard. It runs as a provisional parse (see
+	// ProvisionalParseExpiry): the guard must not commit filename ownership
+	// for a login that may never be saved. KeyOwnership handles this; a
+	// hand-rolled guard should check the context it is handed.
 	Parse func(context.Context, pluginapi.AuthParseRequest) (pluginapi.AuthParseResponse, error)
 	// Fields documents extra provider-owned auth fields.
 	Fields []APIKeyLoginField
@@ -632,7 +638,12 @@ func (l *APIKeyLogin) serveSubmit(ctx context.Context, req pluginapi.ManagementR
 	if s.authDir != "" {
 		path = strings.TrimRight(s.authDir, "/") + "/" + fileName
 	}
-	out, err := l.parse(ctx, pluginapi.AuthParseRequest{Provider: l.provider, FileName: fileName, Path: path, RawJSON: raw})
+	// The validation parse is provisional: no auth file exists yet, and the
+	// login may still be abandoned before the host saves one. Mark the
+	// context with the session expiry so ownership guards (KeyOwnership or
+	// a provider's own) check for duplicates without committing filename
+	// ownership the abandoned login would never release.
+	out, err := l.parse(withProvisionalParse(ctx, s.expiresAt), pluginapi.AuthParseRequest{Provider: l.provider, FileName: fileName, Path: path, RawJSON: raw})
 	if err != nil {
 		mapped := MapError(err)
 		status := mapped.HTTPStatus
