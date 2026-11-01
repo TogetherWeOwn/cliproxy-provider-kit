@@ -465,7 +465,7 @@ func TestLoginPageKeepsSecretsOutOfCommands(t *testing.T) {
 	}
 	// The command is HTML-escaped inside <pre>: check the pasted text.
 	body := html.UnescapeString(string(page.Body))
-	if !strings.Contains(body, "read -s") || !strings.Contains(body, "$CLIPROXY_BASE") {
+	if !strings.Contains(body, "read -rs") || !strings.Contains(body, "$CLIPROXY_BASE") {
 		t.Fatalf("page missing hidden-input instructions: %s", body)
 	}
 	if strings.Contains(body, "YOUR_API_KEY") {
@@ -486,7 +486,7 @@ func TestLoginPageKeepsSecretsOutOfCommands(t *testing.T) {
 	}
 	// Prompts stay portable: printf carries the prompt (zsh rejects read -p)
 	// and values are shell-escaped with builtins before reaching curl.
-	for _, want := range []string{"printf 'Management key: '; read -s", "${PLUGIN_API_KEY//\\\\/\\\\\\\\}"} {
+	for _, want := range []string{"printf 'Management key: '; read -rs", "read -rs PLUGIN_API_KEY", "${PLUGIN_API_KEY//\\\\/\\\\\\\\}"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("page missing portable prompt or builtin escaping %q: %s", want, body)
 		}
@@ -515,8 +515,8 @@ func TestLoginPageIncludesRequiredFields(t *testing.T) {
 	// Every declared field is prompted for and lands in the JSON body, so a
 	// verbatim run cannot fail with "missing required field".
 	for _, want := range []string{
-		"read PLUGIN_FIELD_ACCOUNT_ID",
-		"read PLUGIN_FIELD_NOTE",
+		"read -r PLUGIN_FIELD_ACCOUNT_ID",
+		"read -r PLUGIN_FIELD_NOTE",
 		`"account_id":"$ESC_FIELD_ACCOUNT_ID"`,
 		`"note":"$ESC_FIELD_NOTE"`,
 		"Account ID (required)",

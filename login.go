@@ -410,10 +410,12 @@ func loginJSONString(s string) string {
 // servePage renders the login page for a pending session. The page holds the
 // session state and a copy-paste shell block only; the API key and the
 // management key are typed into the operator's terminal, never into this page.
-// The block is written for bash and zsh (prompt via printf, hidden input via
-// read -s): both secrets travel over stdin — the bearer header in a
-// process-substitution file, the JSON body in a heredoc — so neither appears
-// in process arguments, shell history, a URL, or a log line.
+// The block is written for bash and zsh (prompt via printf, hidden raw input
+// via read -rs, plain raw input via read -r: raw mode keeps backslashes in
+// keys intact, and -p is avoided because zsh gives it another meaning). Both
+// secrets travel over stdin — the bearer header in a process-substitution
+// file, the JSON body in a heredoc — so neither appears in process arguments,
+// shell history, a URL, or a log line.
 func (l *APIKeyLogin) servePage(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
 	l.mu.Lock()
 	mgmtBase := l.mgmtBase
@@ -439,8 +441,8 @@ func (l *APIKeyLogin) servePage(req pluginapi.ManagementRequest) pluginapi.Manag
 			"shell history, process arguments, URLs, or logs. " +
 			"The key travels in the POST body only.</p>")
 		var cmd strings.Builder
-		cmd.WriteString("printf 'Management key: '; read -s CLIPROXY_MANAGEMENT_KEY; echo\n")
-		cmd.WriteString("printf '" + loginShellSingle(l.provider) + " API key: '; read -s PLUGIN_API_KEY; echo\n")
+		cmd.WriteString("printf 'Management key: '; read -rs CLIPROXY_MANAGEMENT_KEY; echo\n")
+		cmd.WriteString("printf '" + loginShellSingle(l.provider) + " API key: '; read -rs PLUGIN_API_KEY; echo\n")
 		for _, f := range l.fields {
 			prompt := strings.TrimSpace(f.Label)
 			if prompt == "" {
@@ -451,7 +453,7 @@ func (l *APIKeyLogin) servePage(req pluginapi.ManagementRequest) pluginapi.Manag
 			} else {
 				prompt += " (optional)"
 			}
-			cmd.WriteString("printf '" + loginShellSingle(prompt) + ": '; read " + loginShellVar(f.Name) + "; echo\n")
+			cmd.WriteString("printf '" + loginShellSingle(prompt) + ": '; read -r " + loginShellVar(f.Name) + "; echo\n")
 		}
 		// Header values must not span lines: strip CR/LF from the management
 		// key with builtins before it reaches the header file. The header
