@@ -107,6 +107,11 @@ type APIKeyLogin struct {
 
 // NewAPIKeyLogin validates the config. Parse must be non-nil: the submit
 // endpoint only stores keys that pass the provider's own checks.
+//
+// Wire the result into both APIKeyAuth.Login and the Definition's
+// Capabilities.ManagementAPI: the first serves StartLogin/PollLogin, the
+// second registers the login page and key-submit routes. Setting only one
+// leaves StartLogin failing with login_unavailable.
 func NewAPIKeyLogin(cfg APIKeyLoginConfig) (*APIKeyLogin, error) {
 	provider := strings.TrimSpace(cfg.Provider)
 	if provider == "" || strings.Contains(provider, "..") || strings.ContainsAny(provider, "/\\ \t\r\n") {
