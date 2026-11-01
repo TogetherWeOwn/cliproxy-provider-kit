@@ -131,7 +131,7 @@ func TestLoginRegistrationAdvertisesManagement(t *testing.T) {
 	}
 }
 
-func TestLoginStartRequiresRegistrationAndBaseURL(t *testing.T) {
+func TestLoginStartRequiresRegistration(t *testing.T) {
 	login := echoLogin(t)
 	r := newRuntime(t, Definition{Metadata: metadata(), Capabilities: pluginapi.Capabilities{
 		AuthProvider: APIKeyAuth{Provider: "echo", Login: login}, ManagementAPI: login}}, nil)
@@ -140,10 +140,21 @@ func TestLoginStartRequiresRegistrationAndBaseURL(t *testing.T) {
 	if env := rpc(t, r, "auth.login.start", pluginapi.AuthLoginStartRequest{BaseURL: loginBaseURL}); env.OK || env.Error.Code != "login_unavailable" {
 		t.Fatalf("unregistered start: %+v", env)
 	}
+	// The page URL is root-relative, so StartLogin no longer depends on the
+	// host callback base URL: any value (including empty) works once routes
+	// are registered.
 	registered := loginRuntime(t, login)
-	for _, base := range []string{"", "not-a-url", "ftp://host/x", "http://"} {
-		if env := rpc(t, registered, "auth.login.start", pluginapi.AuthLoginStartRequest{BaseURL: base}); env.OK || env.Error.Code != "login_unavailable" {
+	for _, base := range []string{"", "not-a-url", "ftp://host/x", "http://", loginBaseURL} {
+		env := rpc(t, registered, "auth.login.start", pluginapi.AuthLoginStartRequest{BaseURL: base})
+		if !env.OK {
 			t.Fatalf("base %q: %+v", base, env)
+		}
+		var resp pluginapi.AuthLoginStartResponse
+		if err := json.Unmarshal(env.Result, &resp); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.HasPrefix(resp.URL, loginResourceBase+"/login?state=") {
+			t.Fatalf("base %q: page url %q", base, resp.URL)
 		}
 	}
 }
@@ -151,8 +162,13 @@ func TestLoginStartRequiresRegistrationAndBaseURL(t *testing.T) {
 func TestLoginFullFlow(t *testing.T) {
 	r := loginRuntime(t, echoLogin(t))
 	start := startLogin(t, r)
-	if !strings.HasPrefix(start.URL, "http://127.0.0.1:19000"+loginResourceBase+"/login?state=") {
+	// Root-relative on purpose: absolutizing with the host's loopback base
+	// would hand the panel a link a remote browser cannot load.
+	if !strings.HasPrefix(start.URL, loginResourceBase+"/login?state=") {
 		t.Fatalf("page url %q", start.URL)
+	}
+	if strings.Contains(start.URL, "://") {
+		t.Fatalf("page url must be relative, got %q", start.URL)
 	}
 	if len(start.State) != 32 || strings.Trim(start.State, "0123456789abcdef") != "" {
 		t.Fatalf("state %q", start.State)
@@ -170,6 +186,13 @@ func TestLoginFullFlow(t *testing.T) {
 	if !strings.Contains(body, start.State) || !strings.Contains(body, "curl -X POST") || !strings.Contains(body, "api_key") {
 		t.Fatalf("page missing instructions: %s", body)
 	}
+	// The page mirrors the panel's login steps and steers operators away
+	// from the panel's OAuth-only callback box.
+	for _, want := range []string{"Return to the management UI", "callback-URL box is only for OAuth providers"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("page missing %q: %s", want, body)
+		}
+	}
 
 	poll := func() pluginapi.AuthLoginPollResponse {
 		env := rpc(t, r, "auth.login.poll", pluginapi.AuthLoginPollRequest{Provider: "echo", State: start.State})
@@ -182,7 +205,7 @@ func TestLoginFullFlow(t *testing.T) {
 		}
 		return resp
 	}
-	if got := poll(); got.Status != pluginapi.AuthLoginStatusPending || !strings.Contains(got.Message, start.URL) {
+	if got := poll(); got.Status != pluginapi.AuthLoginStatusPending || !strings.Contains(got.Message, "completes automatically") {
 		t.Fatalf("pending %+v", got)
 	}
 

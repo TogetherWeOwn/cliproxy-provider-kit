@@ -22,17 +22,20 @@ import (
 // The management UI shows a "Start <name> Login" card for every plugin with an
 // AuthProvider, but StartLogin used to fail for API-key providers, surfacing
 // only as a generic "failed to generate authorization url". This helper makes
-// StartLogin succeed with no host change:
+// StartLogin succeed with no host change. The panel renders the plugin card
+// with its standard OAuth dialog (open-link step, callback-URL box, status
+// polling, success view); the API-key flow below completes through that same
+// dialog's polling and success states.
 //
-//  1. StartLogin mints a random session and returns the URL of a kit-served
-//     login page: a browser-navigable resource route (GET, unauthenticated,
-//     served by the host at /v0/resource/plugins/<id>/login?state=...). The
-//     URL keeps the host callback origin (a loopback address on a default
-//     host): a browser on the host machine opens it directly, while a remote
-//     operator swaps in the host's public base — the page path itself is
-//     origin-independent. The plugin cannot learn the public origin without
-//     a host change, so the returned URL stays absolute (non-browser clients
-//     need it) rather than root-relative.
+//  1. StartLogin mints a random session and returns a ROOT-RELATIVE login page
+//     URL (resource route, GET, unauthenticated, served by the host under
+//     /v0/resource/plugins/<id>/login?state=...). The host passes the URL to
+//     the panel verbatim, and the panel opens it against its own origin —
+//     which is the host itself, since the host serves the panel. An absolute
+//     URL can only reuse the loopback origin the host hands to StartLogin,
+//     which a remote operator's browser cannot load; the relative URL resolves
+//     wherever the panel runs. (The panel tolerates relative URLs: its
+//     link-splitting falls back to plain text and window.open resolves them.)
 //  2. The page carries no secrets. It shows copy-paste shell commands that
 //     read the management key and the API key with hidden input and POST
 //     them to a kit-served management route, so neither secret lands in the
@@ -115,7 +118,6 @@ type APIKeyLoginConfig struct {
 
 type loginSession struct {
 	expiresAt time.Time
-	pageURL   string
 	authDir   string
 	auth      pluginapi.AuthData
 	auths     []pluginapi.AuthData
@@ -206,21 +208,6 @@ func NewAPIKeyLogin(cfg APIKeyLoginConfig) (*APIKeyLogin, error) {
 		sessions: make(map[string]*loginSession), mgmtBase: defaultManagementBase}, nil
 }
 
-// loginOrigin derives the scheme://host origin of the login page from the
-// host callback base URL the host passes to StartLogin. Only the origin is
-// kept: the callback path itself is host-local and meaningless to the
-// operator's browser.
-func loginOrigin(baseURL string) (string, error) {
-	u, err := url.Parse(strings.TrimSpace(baseURL))
-	if err != nil {
-		return "", rpcError("login_unavailable", "host login base URL is not a URL", 500)
-	}
-	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || strings.ContainsAny(u.Host, " \t\r\n'\"") {
-		return "", rpcError("login_unavailable", "host login base URL is missing", 500)
-	}
-	return u.Scheme + "://" + u.Host, nil
-}
-
 func (l *APIKeyLogin) evictLocked(now time.Time) {
 	for state, s := range l.sessions {
 		if !now.Before(s.expiresAt) {
@@ -241,16 +228,16 @@ func (l *APIKeyLogin) evictLocked(now time.Time) {
 	}
 }
 
-// StartLogin mints a pending session and returns the login page URL. It fails
-// only when the host gave no usable base URL or the management routes were
+// StartLogin mints a pending session and returns the login page URL. The URL
+// is root-relative on purpose: the host callback base URL the host passes in
+// is loopback-only, so absolutizing with it would hand the panel a link the
+// operator's browser cannot load. The panel opens the relative URL against
+// its own origin (the host, which serves the panel), so the page loads both
+// locally and remotely. StartLogin fails only when the management routes were
 // never registered, in which case the host keeps its generic error.
 func (l *APIKeyLogin) StartLogin(_ context.Context, req pluginapi.AuthLoginStartRequest) (pluginapi.AuthLoginStartResponse, error) {
 	if l == nil {
 		return pluginapi.AuthLoginStartResponse{}, rpcError("api_key_only", "API-key only: create an auth JSON file", 400)
-	}
-	origin, err := loginOrigin(req.BaseURL)
-	if err != nil {
-		return pluginapi.AuthLoginStartResponse{}, err
 	}
 	var raw [16]byte
 	if _, err := rand.Read(raw[:]); err != nil {
@@ -264,8 +251,8 @@ func (l *APIKeyLogin) StartLogin(_ context.Context, req pluginapi.AuthLoginStart
 		return pluginapi.AuthLoginStartResponse{}, rpcError("login_unavailable", "login routes are not registered", 500)
 	}
 	l.evictLocked(now)
-	pageURL := origin + l.resourceBase + "/" + loginPageRoute + "?state=" + url.QueryEscape(state)
-	l.sessions[state] = &loginSession{expiresAt: now.Add(l.ttl), pageURL: pageURL, authDir: strings.TrimSpace(req.Host.AuthDir)}
+	pageURL := l.resourceBase + "/" + loginPageRoute + "?state=" + url.QueryEscape(state)
+	l.sessions[state] = &loginSession{expiresAt: now.Add(l.ttl), authDir: strings.TrimSpace(req.Host.AuthDir)}
 	l.mu.Unlock()
 	return pluginapi.AuthLoginStartResponse{Provider: l.provider, URL: pageURL, State: state, ExpiresAt: now.Add(l.ttl)}, nil
 }
@@ -290,7 +277,7 @@ func (l *APIKeyLogin) PollLogin(_ context.Context, req pluginapi.AuthLoginPollRe
 		return pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusPending, Message: "login was already collected by another poll; finishing"}, nil
 	}
 	if !s.done {
-		return pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusPending, Message: "waiting for the API key submission from " + s.pageURL}, nil
+		return pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusPending, Message: "waiting for the API key submission: open the login link, run its command block, then return here; this login completes automatically"}, nil
 	}
 	auth, auths := s.auth, s.auths
 	s.consumed = true
@@ -456,15 +443,23 @@ func (l *APIKeyLogin) servePage(req pluginapi.ManagementRequest) pluginapi.Manag
 	var b strings.Builder
 	b.WriteString("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">")
 	b.WriteString("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">")
-	b.WriteString("<title>" + html.EscapeString(l.provider) + " API key login</title></head><body>")
-	b.WriteString("<h1>" + html.EscapeString(l.provider) + " API key login</h1>")
+	b.WriteString("<title>" + html.EscapeString(l.provider) + " login</title>")
+	b.WriteString("<style>body{font-family:system-ui,-apple-system,sans-serif;max-width:44rem;margin:2rem auto;padding:0 1rem;line-height:1.5}" +
+		"pre{background:#f4f4f5;padding:1rem;overflow-x:auto;border-radius:.5rem}" +
+		"ol.steps{padding-left:1.25rem}ol.steps>li{margin:.5rem 0}.note{color:#52525b}</style></head><body>")
+	b.WriteString("<h1>" + html.EscapeString(l.provider) + " login</h1>")
 	if s == nil {
 		b.WriteString("<p>This login session expired or does not exist. In the management UI, click <b>Start " +
 			html.EscapeString(l.provider) + " Login</b> again to get a fresh login page.</p>")
 	} else {
-		b.WriteString("<p>Paste the block below into <b>bash or zsh</b> on any machine that reaches the CLIProxy host. " +
-			"Set CLIPROXY_BASE to the host's public base URL (for example https://host:port). " +
-			"On a remote host always use https:// so the management key and the API key are encrypted in transit; " +
+		b.WriteString("<ol class=\"steps\">" +
+			"<li><b>Copy</b> the command block below.</li>" +
+			"<li><b>Paste it into bash or zsh</b> on any machine that reaches the CLIProxy host. " +
+			"Set CLIPROXY_BASE to the host's public base URL (for example https://host:port).</li>" +
+			"<li><b>Return to the management UI.</b> This login completes automatically a few seconds after the command succeeds.</li>" +
+			"</ol>" +
+			"<p class=\"note\">The panel's callback-URL box is only for OAuth providers and is not used for API-key logins; leave it alone.</p>" +
+			"<p>On a remote host always use https:// so the management key and the API key are encrypted in transit; " +
 			"plain http:// is only acceptable on a loopback address you trust. " +
 			"The secrets are read with hidden input and travel over stdin only: they never appear in the pasted text, " +
 			"shell history, process arguments, URLs, or logs. " +
@@ -513,8 +508,7 @@ func (l *APIKeyLogin) servePage(req pluginapi.ManagementRequest) pluginapi.Manag
 		}
 		cmd.WriteString(unset + "\n}\n")
 		b.WriteString("<pre>" + html.EscapeString(cmd.String()) + "</pre>")
-		b.WriteString("<p>Leave optional fields blank to skip them. Keep polling this login in the management UI; " +
-			"it completes a few seconds after the POST succeeds. This page expires " +
+		b.WriteString("<p>Leave optional fields blank to skip them. This page expires " +
 			html.EscapeString(s.expiresAt.UTC().Format(time.RFC3339)) + ".</p>")
 		if len(l.fields) > 0 {
 			b.WriteString("<h2>Provider fields</h2><ul>")
