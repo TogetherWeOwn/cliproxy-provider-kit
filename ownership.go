@@ -113,7 +113,11 @@ func (g *KeyOwnership) Claim(ctx context.Context, fileName string, digest [32]by
 		return duplicateAuthError()
 	}
 	if expiresAt, provisional := ProvisionalParseExpiry(ctx); provisional {
-		if g.owners[digest] != fileName {
+		// Overlapping login sessions for one key share the deterministic
+		// login filename, so a resubmission from an earlier session must
+		// never shorten the reservation a later session still relies on:
+		// keep the latest expiry.
+		if claim, ok := g.pending[digest]; g.owners[digest] != fileName && (!ok || expiresAt.After(claim.expiresAt)) {
 			g.pending[digest] = pendingClaim{file: fileName, expiresAt: expiresAt}
 		}
 		return nil

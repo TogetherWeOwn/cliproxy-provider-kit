@@ -71,6 +71,35 @@ func TestKeyOwnershipProvisionalExpires(t *testing.T) {
 	}
 }
 
+// TestKeyOwnershipProvisionalKeepsLatestExpiry covers two overlapping
+// login sessions for the same key (same deterministic filename) submitted in
+// reverse order: the earlier session's late resubmission must not shorten
+// the reservation while the later session is still live, or an upload in
+// the gap would take the key and the live login's saved file would then
+// fail as a duplicate.
+func TestKeyOwnershipProvisionalKeepsLatestExpiry(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	g := ownershipGuard(&now)
+	digest := digestOf("example-key")
+	earlier := withProvisionalParse(context.Background(), now.Add(15*time.Minute))
+	later := withProvisionalParse(context.Background(), now.Add(20*time.Minute))
+
+	if err := g.Claim(later, "echo-login.json", digest); err != nil {
+		t.Fatalf("later session submit: %v", err)
+	}
+	if err := g.Claim(earlier, "echo-login.json", digest); err != nil {
+		t.Fatalf("earlier session resubmit: %v", err)
+	}
+	now = now.Add(16 * time.Minute) // earlier session expired, later still live
+	if err := g.Claim(context.Background(), "upload.json", digest); err == nil {
+		t.Fatal("upload accepted while the later login session is still live")
+	}
+	now = now.Add(5 * time.Minute) // both sessions expired
+	if err := g.Claim(context.Background(), "upload.json", digest); err != nil {
+		t.Fatalf("upload after both sessions expired: %v", err)
+	}
+}
+
 func TestKeyOwnershipProvisionalRespectsCommittedOwner(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	g := ownershipGuard(&now)
