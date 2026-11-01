@@ -505,3 +505,22 @@ func TestNewQuotaBucket(t *testing.T) {
 		t.Fatalf("bucket must not set Description: %+v", b)
 	}
 }
+
+// TestQuotaWindowLabelCanonical pins the canonical spellings plus the
+// verbatim-passthrough rule: unlisted input (including typos and the empty
+// string) renders trimmed, never remapped.
+func TestQuotaWindowLabelCanonical(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"5H", "5-hour limit"},
+		{"Weekly", "Weekly limit"},
+		{"MONTHLY", "Monthly limit"},
+		{" per-minute ", "per-minute"},
+		{"weekly limit", "Weekly limit"},
+		{"weakly", "weakly"},
+		{"", ""},
+	} {
+		if got := QuotaWindowLabel(tc.in); got != tc.want {
+			t.Errorf("QuotaWindowLabel(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}

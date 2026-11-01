@@ -198,14 +198,18 @@ func (q *CachedQuota) ResetQuota(context.Context, pluginapi.QuotaResetRequest) (
 
 // Canonical quota card labels.
 //
-// The management panel renders every plugin quota bucket with the label
-// displayName ?? description ?? window, and the host drops displayName before
-// the panel ever sees it. A bucket Description therefore becomes the row label
-// and tooltip while Window is hidden, so long explanations must never be set
-// as Description. Keep bucket labels short and window-style with
+// The plugin QuotaBucket type has no displayName field, so the panel renders
+// each bucket row with the label description ?? window (group displayName is
+// a separate group header). A bucket Description therefore becomes the row
+// label and tooltip while Window is hidden, so long explanations must never
+// be set as Description. Keep bucket labels short and window-style with
 // QuotaWindowLabel and NewQuotaBucket, and put absolute amounts in the label
 // only where they add information (for example, "Weekly key limit · $5.00 of
 // $5.00 left").
+//
+// Only the listed spellings canonicalize; anything else (including typos and
+// the empty string) passes through verbatim after trimming, so callers must
+// spell windows deliberately.
 func QuotaWindowLabel(window string) string {
 	switch strings.ToLower(strings.TrimSpace(window)) {
 	case "5h", "five-hour", "five_hour", "5-hour", "5-hour limit":
@@ -217,13 +221,16 @@ func QuotaWindowLabel(window string) string {
 	case "daily", "day", "daily limit":
 		return "Daily limit"
 	default:
-		return window
+		return strings.TrimSpace(window)
 	}
 }
 
 // NewQuotaBucket builds one quota bar row: a canonical window label, the
 // remaining fraction, and the reset time. It never sets Description, so the
-// panel shows the short Window label instead of a sentence.
+// panel shows the short Window label instead of a sentence. remainingFraction
+// is the fraction remaining in [0, 1] (unclamped; NaN fails host decoding),
+// and resetTime is an RFC 3339 instant or "" when the window has no reset
+// (the panel then shows "-").
 func NewQuotaBucket(window string, remainingFraction float64, resetTime string) pluginapi.QuotaBucket {
 	return pluginapi.QuotaBucket{Window: QuotaWindowLabel(window), RemainingFraction: remainingFraction, ResetTime: resetTime}
 }
