@@ -14,8 +14,9 @@ import (
 // Passthrough is a thin executor. BuildRequest selects the provider protocol,
 // endpoint and authentication; it must preserve the host's final business payload
 // (the host already applied payload rules). No protocol translation is done here.
-// ExecuteStream re-frames the raw upstream SSE bytes into one host chunk per
-// data event (see frameStreamChunks); callers must not frame again.
+// ExecuteStream re-frames SSE upstream bytes into one host chunk per data
+// event (see frameStreamChunks) and forwards other wire formats unchanged;
+// callers must not frame again.
 // HttpRequest copies the supplied HTTP request unless PrepareHTTP is provided.
 // Every network operation uses the injected HostHTTPClient; there is no fallback.
 // Provider-specific quota/exhaustion classification belongs in ClassifyError.
