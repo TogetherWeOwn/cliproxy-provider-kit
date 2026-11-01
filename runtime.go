@@ -86,8 +86,9 @@ func ValidateMetadata(m pluginapi.Metadata) error {
 }
 
 // New validates a definition. The runtime starts inactive until plugin.register.
-// Supported capabilities are auth, models, executor, quota and usage; unrelated
-// SDK capabilities are rejected instead of silently advertised without dispatch.
+// Supported capabilities are auth, models, executor, quota, usage and
+// management; unrelated SDK capabilities are rejected instead of silently
+// advertised without dispatch.
 func New(d Definition, h Caller) (*Runtime, error) {
 	if err := ValidateMetadata(d.Metadata); err != nil {
 		return nil, err
@@ -108,7 +109,7 @@ func New(d Definition, h Caller) (*Runtime, error) {
 	if c.ExecutorModelScope != "" && c.ExecutorModelScope != pluginapi.ExecutorModelScopeBoth && c.ExecutorModelScope != pluginapi.ExecutorModelScopeStatic && c.ExecutorModelScope != pluginapi.ExecutorModelScopeOAuth {
 		return nil, fmt.Errorf("invalid executor model scope")
 	}
-	if c.FrontendAuthProvider != nil || c.Scheduler != nil || c.ModelRouter != nil || c.RequestTranslator != nil || c.RequestNormalizer != nil || c.ResponseTranslator != nil || c.ResponseBeforeTranslator != nil || c.ResponseAfterTranslator != nil || c.RequestInterceptor != nil || c.RequestBodyPatcherBefore != nil || c.RequestBodyPatcherAfter != nil || c.RequestLifecyclePlugin != nil || c.ResponseInterceptor != nil || c.StreamChunkInterceptor != nil || c.WebSocketResponseObserver != nil || c.ThinkingApplier != nil || c.CommandLinePlugin != nil || c.ManagementAPI != nil {
+	if c.FrontendAuthProvider != nil || c.Scheduler != nil || c.ModelRouter != nil || c.RequestTranslator != nil || c.RequestNormalizer != nil || c.ResponseTranslator != nil || c.ResponseBeforeTranslator != nil || c.ResponseAfterTranslator != nil || c.RequestInterceptor != nil || c.RequestBodyPatcherBefore != nil || c.RequestBodyPatcherAfter != nil || c.RequestLifecyclePlugin != nil || c.ResponseInterceptor != nil || c.StreamChunkInterceptor != nil || c.WebSocketResponseObserver != nil || c.ThinkingApplier != nil || c.CommandLinePlugin != nil {
 		return nil, fmt.Errorf("unsupported capability in provider definition")
 	}
 	// Schema 10 multi-auth entries are not dispatched: auth.identifier answers a
@@ -135,6 +136,7 @@ type wireCapabilities struct {
 	Output    []string                     `json:"executor_output_formats,omitempty"`
 	Quota     bool                         `json:"quota_provider"`
 	Usage     bool                         `json:"usage_plugin"`
+	Mgmt      bool                         `json:"management_api"`
 }
 
 func (r *Runtime) registration() registration {
@@ -143,7 +145,7 @@ func (r *Runtime) registration() registration {
 	if c.Executor != nil && scope == "" {
 		scope = pluginapi.ExecutorModelScopeBoth
 	}
-	return registration{pluginabi.SchemaVersion, r.def.Metadata, wireCapabilities{c.AuthProvider != nil, c.ModelProvider != nil, c.ModelRegistrar != nil, c.Executor != nil, scope, c.ExecutorInputFormats, c.ExecutorOutputFormats, c.QuotaProvider != nil, c.UsagePlugin != nil}}
+	return registration{pluginabi.SchemaVersion, r.def.Metadata, wireCapabilities{c.AuthProvider != nil, c.ModelProvider != nil, c.ModelRegistrar != nil, c.Executor != nil, scope, c.ExecutorInputFormats, c.ExecutorOutputFormats, c.QuotaProvider != nil, c.UsagePlugin != nil, c.ManagementAPI != nil}}
 }
 
 // Call always returns a valid RPC envelope. Panics on the synchronous dispatch
@@ -446,6 +448,19 @@ func (r *Runtime) dispatch(ctx context.Context, m string, raw []byte, finish fun
 				c.UsagePlugin.HandleUsage(ctx, q)
 			}
 			return struct{}{}, false, err
+		}
+	case pluginabi.MethodManagementRegister:
+		if c.ManagementAPI != nil {
+			result, err = invoke(ctx, raw, c.ManagementAPI.RegisterManagement)
+			return result, false, err
+		}
+	case pluginabi.MethodManagementHandle:
+		// The host replaces declared route handlers with its RPC adapter, so
+		// every route call arrives here and the ManagementAPI implementation
+		// dispatches it to the matching route itself.
+		if h, ok := c.ManagementAPI.(pluginapi.ManagementHandler); ok && h != nil {
+			result, err = invoke(ctx, raw, h.HandleManagement)
+			return result, false, err
 		}
 	default:
 		return nil, false, rpcError("unknown_method", "unknown RPC method", 404)
