@@ -131,7 +131,7 @@ func TestLoginRegistrationAdvertisesManagement(t *testing.T) {
 	}
 }
 
-func TestLoginStartRequiresRegistrationAndBaseURL(t *testing.T) {
+func TestLoginStartRequiresRegistration(t *testing.T) {
 	login := echoLogin(t)
 	r := newRuntime(t, Definition{Metadata: metadata(), Capabilities: pluginapi.Capabilities{
 		AuthProvider: APIKeyAuth{Provider: "echo", Login: login}, ManagementAPI: login}}, nil)
@@ -140,10 +140,114 @@ func TestLoginStartRequiresRegistrationAndBaseURL(t *testing.T) {
 	if env := rpc(t, r, "auth.login.start", pluginapi.AuthLoginStartRequest{BaseURL: loginBaseURL}); env.OK || env.Error.Code != "login_unavailable" {
 		t.Fatalf("unregistered start: %+v", env)
 	}
+	// The page URL is root-relative, so StartLogin no longer depends on the
+	// host callback base URL: any value (including empty) works once routes
+	// are registered.
 	registered := loginRuntime(t, login)
-	for _, base := range []string{"", "not-a-url", "ftp://host/x", "http://"} {
-		if env := rpc(t, registered, "auth.login.start", pluginapi.AuthLoginStartRequest{BaseURL: base}); env.OK || env.Error.Code != "login_unavailable" {
+	for _, base := range []string{"", "not-a-url", "ftp://host/x", "http://", loginBaseURL} {
+		env := rpc(t, registered, "auth.login.start", pluginapi.AuthLoginStartRequest{BaseURL: base})
+		if !env.OK {
 			t.Fatalf("base %q: %+v", base, env)
+		}
+		var resp pluginapi.AuthLoginStartResponse
+		if err := json.Unmarshal(env.Result, &resp); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.HasPrefix(resp.URL, loginResourceBase+"/login?state=") {
+			t.Fatalf("base %q: page url %q", base, resp.URL)
+		}
+	}
+}
+
+// TestLoginRejectsEmptyResourceBase pins the only remaining StartLogin
+// failure mode: registration without a resource base (routes never
+// registered) keeps failing with login_unavailable.
+func TestLoginRejectsEmptyResourceBase(t *testing.T) {
+	login := echoLogin(t)
+	r := newRuntime(t, Definition{Metadata: metadata(), Capabilities: pluginapi.Capabilities{
+		AuthProvider: APIKeyAuth{Provider: "echo", Login: login}, ManagementAPI: login}}, nil)
+	register(t, r)
+	env := rpc(t, r, "management.register", pluginapi.ManagementRegistrationRequest{
+		BasePath: "/v0/management", ResourceBasePath: ""})
+	if !env.OK {
+		t.Fatalf("register management: %+v", env.Error)
+	}
+	if env := rpc(t, r, "auth.login.start", pluginapi.AuthLoginStartRequest{BaseURL: loginBaseURL}); env.OK || env.Error.Code != "login_unavailable" {
+		t.Fatalf("empty resource base start: %+v", env)
+	}
+}
+
+// TestLoginNormalizesBareRouteBases proves bases without a leading slash
+// still yield root-relative page URLs and a management-base submit block: a
+// bare "v0/..." URL would resolve against the panel's route path instead of
+// its origin. It also pins the two-base split (page served from the resource
+// base, key posted to the management base) and distinct consecutive states.
+func TestLoginNormalizesBareRouteBases(t *testing.T) {
+	login := echoLogin(t)
+	r := newRuntime(t, Definition{Metadata: metadata(), Capabilities: pluginapi.Capabilities{
+		AuthProvider: APIKeyAuth{Provider: "echo", Login: login}, ManagementAPI: login}}, nil)
+	register(t, r)
+	env := rpc(t, r, "management.register", pluginapi.ManagementRegistrationRequest{
+		BasePath: "v0/management", ResourceBasePath: "v0/resource/plugins/echo-id"})
+	if !env.OK {
+		t.Fatalf("register management: %+v", env.Error)
+	}
+	var first pluginapi.AuthLoginStartResponse
+	for i := 0; i < 2; i++ {
+		env := rpc(t, r, "auth.login.start", pluginapi.AuthLoginStartRequest{BaseURL: loginBaseURL})
+		if !env.OK {
+			t.Fatalf("start: %+v", env)
+		}
+		var resp pluginapi.AuthLoginStartResponse
+		if err := json.Unmarshal(env.Result, &resp); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.HasPrefix(resp.URL, "/v0/resource/plugins/echo-id/login?state=") || strings.Contains(resp.URL, "://") {
+			t.Fatalf("page url %q", resp.URL)
+		}
+		if i == 0 {
+			first = resp
+		} else if resp.State == first.State || resp.URL == first.URL {
+			t.Fatalf("states not distinct: %+v %+v", first, resp)
+		}
+	}
+	page := manage(t, r, pluginapi.ManagementRequest{Method: "GET",
+		Path: "/v0/resource/plugins/echo-id/login", Query: map[string][]string{"state": {first.State}}})
+	// Quotes are HTML-escaped in the raw body; the path itself is not.
+	if page.StatusCode != 200 || !strings.Contains(string(page.Body), "$CLIPROXY_BASE/v0/management/plugin-login/echo") {
+		t.Fatalf("page posts to the wrong base: %+v", page.StatusCode)
+	}
+}
+
+// TestRouteBaseRejectsHostile pins the shell-safety guard: the base lands
+// inside the operator's pasted shell block in double quotes, so shell
+// metacharacters are rejected to "" (StartLogin then fails login_unavailable
+// instead of serving a hostile block), as is a protocol-relative "//" base
+// that would resolve off-origin in the panel.
+func TestRouteBaseRejectsHostile(t *testing.T) {
+	for _, base := range []string{
+		`/v0/management"$(evil)"`,
+		"/v0/management`evil`",
+		"/v0/$management",
+		`/v0\management`,
+		"/v0/management\n松",
+		"/v0/management\revil",
+		"//evil.com/x",
+		"//",
+	} {
+		if got := routeBase(base); got != "" {
+			t.Errorf("routeBase(%q) = %q, want empty", base, got)
+		}
+	}
+	for base, want := range map[string]string{
+		"":                "",
+		"/":               "",
+		"v0/management":   "/v0/management",
+		"/v0/management/": "/v0/management",
+		"  /v0/m  ":       "/v0/m",
+	} {
+		if got := routeBase(base); got != want {
+			t.Errorf("routeBase(%q) = %q, want %q", base, got, want)
 		}
 	}
 }
@@ -151,8 +255,13 @@ func TestLoginStartRequiresRegistrationAndBaseURL(t *testing.T) {
 func TestLoginFullFlow(t *testing.T) {
 	r := loginRuntime(t, echoLogin(t))
 	start := startLogin(t, r)
-	if !strings.HasPrefix(start.URL, "http://127.0.0.1:19000"+loginResourceBase+"/login?state=") {
+	// Root-relative on purpose: absolutizing with the host's loopback base
+	// would hand the panel a link a remote browser cannot load.
+	if !strings.HasPrefix(start.URL, loginResourceBase+"/login?state=") {
 		t.Fatalf("page url %q", start.URL)
+	}
+	if strings.Contains(start.URL, "://") {
+		t.Fatalf("page url must be relative, got %q", start.URL)
 	}
 	if len(start.State) != 32 || strings.Trim(start.State, "0123456789abcdef") != "" {
 		t.Fatalf("state %q", start.State)
@@ -170,6 +279,13 @@ func TestLoginFullFlow(t *testing.T) {
 	if !strings.Contains(body, start.State) || !strings.Contains(body, "curl -X POST") || !strings.Contains(body, "api_key") {
 		t.Fatalf("page missing instructions: %s", body)
 	}
+	// The page mirrors the panel's login steps and steers operators away
+	// from the panel's OAuth-only callback box.
+	for _, want := range []string{"Return to the management UI", "callback-URL box is only for OAuth providers"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("page missing %q: %s", want, body)
+		}
+	}
 
 	poll := func() pluginapi.AuthLoginPollResponse {
 		env := rpc(t, r, "auth.login.poll", pluginapi.AuthLoginPollRequest{Provider: "echo", State: start.State})
@@ -182,7 +298,7 @@ func TestLoginFullFlow(t *testing.T) {
 		}
 		return resp
 	}
-	if got := poll(); got.Status != pluginapi.AuthLoginStatusPending || !strings.Contains(got.Message, start.URL) {
+	if got := poll(); got.Status != pluginapi.AuthLoginStatusPending || !strings.Contains(got.Message, "completes automatically") {
 		t.Fatalf("pending %+v", got)
 	}
 
@@ -328,6 +444,31 @@ func TestLoginScrubsLeakyProviderErrors(t *testing.T) {
 		Body: []byte(`{"state":"` + start.State + `","api_key":"example-key"}`)})
 	if resp.StatusCode != 400 || strings.Contains(string(resp.Body), "example-key") || !strings.Contains(string(resp.Body), "[redacted]") {
 		t.Fatalf("scrub %+v", resp)
+	}
+}
+
+// TestLoginScrubsEncodedKeyEchoes proves the scrub also catches recoverable
+// forms of the key: a provider echoing the URL-encoded or JSON-escaped key
+// must not leak it into the operator-facing error (and host logs).
+func TestLoginScrubsEncodedKeyEchoes(t *testing.T) {
+	const key = `a"b c/d`
+	leaky := func(_ context.Context, _ pluginapi.AuthParseRequest) (pluginapi.AuthParseResponse, error) {
+		return pluginapi.AuthParseResponse{}, &pluginabi.Error{Code: "upstream_says_no",
+			Message: `upstream rejected a%22b+c%2Fd and a\"b c/d as invalid`, HTTPStatus: 400}
+	}
+	login, err := NewAPIKeyLogin(APIKeyLoginConfig{Provider: "echo", Parse: leaky})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := loginRuntime(t, login)
+	start := startLogin(t, r)
+	resp := manage(t, r, pluginapi.ManagementRequest{Method: "POST", Path: loginSubmitPath,
+		Body: []byte(`{"state":"` + start.State + `","api_key":"` + loginJSONString(key) + `"}`)})
+	body := string(resp.Body)
+	if resp.StatusCode != 400 || strings.Contains(body, key) ||
+		strings.Contains(body, "a%22b+c%2Fd") || strings.Contains(body, `a\"b c/d`) ||
+		strings.Count(body, "[redacted]") != 2 {
+		t.Fatalf("encoded scrub %+v", resp)
 	}
 }
 
