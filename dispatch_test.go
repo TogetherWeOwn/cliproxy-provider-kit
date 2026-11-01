@@ -91,7 +91,7 @@ func TestFailedReconfigureLeavesInactive(t *testing.T) {
 		return nil
 	}}, nil)
 	register(t, r)
-	if env := rpc(t, r, "plugin.reconfigure", map[string]any{"schema_version": 9, "config_yaml": []byte("bad")}); env.OK || env.Error.Message != "plugin operation failed" {
+	if env := rpc(t, r, "plugin.reconfigure", map[string]any{"schema_version": 10, "config_yaml": []byte("bad")}); env.OK || env.Error.Message != "plugin operation failed" {
 		t.Fatal(env)
 	}
 	if env := rpc(t, r, "auth.identifier", map[string]any{}); env.OK || env.Error.Code != "not_ready" {
