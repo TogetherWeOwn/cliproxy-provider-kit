@@ -73,7 +73,10 @@ const (
 // APIKeyLoginField describes one provider-owned auth field, beyond api_key
 // and label, that the login page documents and the submit endpoint accepts.
 type APIKeyLoginField struct {
-	// Name is the JSON key accepted by the submit endpoint.
+	// Name is the JSON key accepted by the submit endpoint. It is also
+	// interpolated into the login page's unquoted heredoc body, so keep it
+	// to [A-Za-z0-9_]: anything else (backslash, $, backticks) would be
+	// interpreted by the operator's shell instead of arriving literally.
 	Name string
 	// Label is the short human-readable name shown on the login page.
 	Label string
@@ -410,6 +413,10 @@ func loginJSONString(s string) string {
 // servePage renders the login page for a pending session. The page holds the
 // session state and a copy-paste shell block only; the API key and the
 // management key are typed into the operator's terminal, never into this page.
+// The block is wrapped in braces so it parses as one compound command: when a
+// paste reaches the shell line by line (bracketed paste off), an unwrapped
+// read -rs would eat the next pasted line as its input and the operator's
+// real key would then run as a command, landing in history and on stderr.
 // The block is written for bash and zsh (prompt via printf, hidden raw input
 // via read -rs, plain raw input via read -r: raw mode keeps backslashes in
 // keys intact, and -p is avoided because zsh gives it another meaning). Both
@@ -441,6 +448,7 @@ func (l *APIKeyLogin) servePage(req pluginapi.ManagementRequest) pluginapi.Manag
 			"shell history, process arguments, URLs, or logs. " +
 			"The key travels in the POST body only.</p>")
 		var cmd strings.Builder
+		cmd.WriteString("{\n")
 		cmd.WriteString("printf 'Management key: '; read -rs CLIPROXY_MANAGEMENT_KEY; echo\n")
 		cmd.WriteString("printf '" + loginShellSingle(l.provider) + " API key: '; read -rs PLUGIN_API_KEY; echo\n")
 		for _, f := range l.fields {
@@ -481,7 +489,7 @@ func (l *APIKeyLogin) servePage(req pluginapi.ManagementRequest) pluginapi.Manag
 			v := loginShellVar(f.Name)
 			unset += " " + v + " ESC_" + strings.TrimPrefix(v, "PLUGIN_")
 		}
-		cmd.WriteString(unset)
+		cmd.WriteString(unset + "\n}\n")
 		b.WriteString("<pre>" + html.EscapeString(cmd.String()) + "</pre>")
 		b.WriteString("<p>Leave optional fields blank to skip them. Keep polling this login in the management UI; " +
 			"it completes a few seconds after the POST succeeds. This page expires " +

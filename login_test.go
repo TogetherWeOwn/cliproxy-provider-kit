@@ -4,7 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"html"
+	"io"
 	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -587,6 +591,73 @@ func TestLoginResubmitAfterConsumedIsRejected(t *testing.T) {
 		Body: []byte(`{"state":"` + start.State + `","api_key":"other-key"}`)})
 	if again.StatusCode != http.StatusConflict || !strings.Contains(string(again.Body), "login_completed") {
 		t.Fatalf("consumed resubmit not rejected: %+v", again)
+	}
+}
+
+func TestLoginPageBlockSurvivesLineByLinePaste(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash is not available")
+	}
+	echoAuth := APIKeyAuth{Provider: "echo"}
+	login, err := NewAPIKeyLogin(APIKeyLoginConfig{Provider: "echo", Parse: echoAuth.ParseAuth,
+		Fields: []APIKeyLoginField{{Name: "account_id", Label: "Account ID", Required: true}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := loginRuntime(t, login)
+	start := startLogin(t, r)
+	page := manage(t, r, pluginapi.ManagementRequest{Method: "GET", Path: loginResourceBase + "/login",
+		Query: map[string][]string{"state": {start.State}}})
+	if page.StatusCode != 200 {
+		t.Fatalf("page %+v", page)
+	}
+	body := html.UnescapeString(string(page.Body))
+	pre, post := strings.Index(body, "<pre>"), strings.Index(body, "</pre>")
+	if pre < 0 || post < 0 || post <= pre {
+		t.Fatalf("page has no pasted block: %s", body)
+	}
+	block := body[pre+len("<pre>") : post]
+	lines := strings.Split(strings.TrimSpace(block), "\n")
+	if len(lines) < 2 || strings.TrimSpace(lines[0]) != "{" || strings.TrimSpace(lines[len(lines)-1]) != "}" {
+		t.Fatalf("pasted block is not brace-grouped, so a line-by-line paste feeds script lines to read:\n%s", block)
+	}
+	// Nasty but exact: quotes, backslashes, tab, $ and backticks must
+	// survive the builtin escaping and the unquoted heredoc verbatim.
+	mgmtKey := "mgmt-test-key"
+	apiKey := "ab\"cd\\ef$HOME`tick`\tplain"
+	account := "ac-1"
+	var gotPath, gotAuth, gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		gotPath, gotAuth = req.URL.Path, req.Header.Get("Authorization")
+		raw, _ := io.ReadAll(req.Body)
+		gotBody = string(raw)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+	// Paste simulation: the block and the typed secrets share one stdin
+	// stream, the way a bracketed-paste-off terminal delivers them. Without
+	// the braces bash runs the first line at once and read -rs eats the
+	// next pasted line; with them bash parses through the closing brace
+	// before any read runs, so the reads consume the secrets that follow.
+	cmd := exec.Command("bash")
+	cmd.Env = append(os.Environ(), "CLIPROXY_BASE="+srv.URL)
+	cmd.Stdin = strings.NewReader(block + mgmtKey + "\n" + apiKey + "\n" + account + "\n")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("pasted block failed: %v\n%s", err, out)
+	}
+	if gotPath != "/v0/management/plugin-login/echo" {
+		t.Fatalf("wrong submit path %q output:\n%s", gotPath, out)
+	}
+	if gotAuth != "Bearer "+mgmtKey {
+		t.Fatalf("management key mangled: %q output:\n%s", gotAuth, out)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(gotBody), &decoded); err != nil {
+		t.Fatalf("body is not valid JSON %q: %v\n%s", gotBody, err, out)
+	}
+	if decoded["state"] != start.State || decoded["api_key"] != apiKey || decoded["account_id"] != account {
+		t.Fatalf("secrets mangled: %s", gotBody)
 	}
 }
 
