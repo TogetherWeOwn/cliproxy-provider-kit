@@ -79,13 +79,21 @@ func TestLoginConfigValidation(t *testing.T) {
 		"blank provider":     {Provider: " ", Parse: parse},
 		"path traversal":     {Provider: "a/../b", Parse: parse},
 		"slash":              {Provider: "a/b", Parse: parse},
+		"shell provider":     {Provider: "a$b`c", Parse: parse},
+		"quoted provider":    {Provider: `a'b"c`, Parse: parse},
+		"leading dash":       {Provider: "-echo", Parse: parse},
 		"nil parse":          {Provider: "echo"},
 		"blank field":        {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{}}},
+		"shell field":        {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "a$b"}}},
+		"backtick field":     {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "a`b"}}},
+		"dashed field":       {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "a-b"}}},
+		"dotted field":       {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "a.b"}}},
+		"spaced field":       {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "a b"}}},
 		"reserved field":     {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "api_key"}}},
 		"host-managed field": {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "weight"}}},
 		"duplicate field":    {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "x"}, {Name: "x"}}},
 		"reserved id":        {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "id"}}},
-		"shell collision":    {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "a-b"}, {Name: "a_b"}}},
+		"shell collision":    {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "Region"}, {Name: "region"}}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := NewAPIKeyLogin(cfg); err == nil {
@@ -95,6 +103,12 @@ func TestLoginConfigValidation(t *testing.T) {
 	}
 	if _, err := NewAPIKeyLogin(APIKeyLoginConfig{Provider: "echo", Parse: parse,
 		Fields: []APIKeyLoginField{{Name: "region", Label: "Region", Required: true}}}); err != nil {
+		t.Fatal(err)
+	}
+	// Dashes are the only punctuation a real provider key needs
+	// (cloudflare-workers-ai, nvidia-nim, zai-coding-plan, opencode-go).
+	if _, err := NewAPIKeyLogin(APIKeyLoginConfig{Provider: "cloudflare-workers-ai", Parse: parse,
+		Fields: []APIKeyLoginField{{Name: "account_id"}, {Name: "daily_free_neurons2"}}}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -495,6 +509,11 @@ func TestLoginPageKeepsSecretsOutOfCommands(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Fatalf("page missing portable prompt or builtin escaping %q: %s", want, body)
 		}
+	}
+	// Remote operators must reach for https first so both secrets are
+	// encrypted in transit; plain http stays a loopback-only option.
+	if !strings.Contains(body, "https://host:port") || !strings.Contains(body, "always use https://") {
+		t.Fatalf("page missing https-first CLIPROXY_BASE guidance: %s", body)
 	}
 }
 
