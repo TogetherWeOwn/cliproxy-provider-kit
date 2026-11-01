@@ -181,8 +181,9 @@ func TestLoginFullFlow(t *testing.T) {
 	if key, err := APIKey(got.Auth.StorageJSON, nil); err != nil || key != "example-key" {
 		t.Fatalf("stored key %q %v", key, err)
 	}
-	// The session is single-consume: a second poll must fail, not replay.
-	if again := poll(); again.Status != pluginapi.AuthLoginStatusError {
+	// Single delivery: a second poll waits credential-free instead of
+	// replaying the credentials or failing the host login session.
+	if again := poll(); again.Status != pluginapi.AuthLoginStatusPending || len(again.Auth.StorageJSON) != 0 {
 		t.Fatalf("replay %+v", again)
 	}
 }
@@ -365,5 +366,105 @@ func TestLoginNilHelperKeepsAPIKeyOnly(t *testing.T) {
 	}
 	if _, err := login.HandleManagement(context.Background(), pluginapi.ManagementRequest{}); err == nil {
 		t.Fatal("nil login handled")
+	}
+}
+
+func TestLoginRegistrationWireRoundTrip(t *testing.T) {
+	login := echoLogin(t)
+	resp, err := login.RegisterManagement(context.Background(), pluginapi.ManagementRegistrationRequest{
+		BasePath: "/v0/management", ResourceBasePath: loginResourceBase})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Mirror of the host rpcManagementRegistrationResponse: decoding must
+	// succeed or the host registers no routes and the login is dead.
+	var wire struct {
+		Routes    []pluginapi.ManagementRoute `json:"routes,omitempty"`
+		Resources []pluginapi.ResourceRoute   `json:"resources,omitempty"`
+	}
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		t.Fatalf("host cannot decode registration: %v", err)
+	}
+	if len(wire.Routes) != 1 || len(wire.Resources) != 1 {
+		t.Fatalf("routes lost on the wire: %+v", wire)
+	}
+}
+
+func TestLoginSubmitAfterExpiryIsRejected(t *testing.T) {
+	expiryAuth := APIKeyAuth{Provider: "echo"}
+	slow := func(ctx context.Context, req pluginapi.AuthParseRequest) (pluginapi.AuthParseResponse, error) {
+		time.Sleep(120 * time.Millisecond)
+		return expiryAuth.ParseAuth(ctx, req)
+	}
+	login, err := NewAPIKeyLogin(APIKeyLoginConfig{Provider: "echo",
+		Parse: slow, SessionTTL: 40 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := loginRuntime(t, login)
+	start := startLogin(t, r)
+	resp := manage(t, r, pluginapi.ManagementRequest{Method: "POST", Path: loginSubmitPath,
+		Body: []byte(`{"state":"` + start.State + `","api_key":"example-key"}`)})
+	if resp.StatusCode != 400 || !strings.Contains(string(resp.Body), "login_expired") {
+		t.Fatalf("expired submit reported success: %+v", resp)
+	}
+}
+
+func TestLoginConcurrentPollSingleDelivery(t *testing.T) {
+	r := loginRuntime(t, echoLogin(t))
+	start := startLogin(t, r)
+	if resp := manage(t, r, pluginapi.ManagementRequest{Method: "POST", Path: loginSubmitPath,
+		Body: []byte(`{"state":"` + start.State + `","api_key":"example-key"}`)}); resp.StatusCode != 200 {
+		t.Fatalf("submit %+v", resp)
+	}
+	poll := func() pluginapi.AuthLoginPollResponse {
+		env := rpc(t, r, "auth.login.poll", pluginapi.AuthLoginPollRequest{State: start.State})
+		if !env.OK {
+			t.Fatalf("poll: %+v", env.Error)
+		}
+		var out pluginapi.AuthLoginPollResponse
+		if err := json.Unmarshal(env.Result, &out); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	first, second := poll(), poll()
+	var success, pending int
+	for _, out := range []pluginapi.AuthLoginPollResponse{first, second} {
+		switch out.Status {
+		case pluginapi.AuthLoginStatusSuccess:
+			success++
+			if len(out.Auth.StorageJSON) == 0 {
+				t.Fatalf("success without credentials: %+v", out)
+			}
+		case pluginapi.AuthLoginStatusPending:
+			pending++
+		default:
+			t.Fatalf("concurrent poll failed the login: %+v", out)
+		}
+	}
+	if success != 1 || pending != 1 {
+		t.Fatalf("want exactly one delivery and one wait, got %+v %+v", first, second)
+	}
+}
+
+func TestLoginPageKeepsSecretsOutOfCommands(t *testing.T) {
+	r := loginRuntime(t, echoLogin(t))
+	start := startLogin(t, r)
+	page := manage(t, r, pluginapi.ManagementRequest{Method: "GET", Path: loginResourceBase + "/login",
+		Query: map[string][]string{"state": {start.State}}})
+	if page.StatusCode != 200 {
+		t.Fatalf("page %+v", page)
+	}
+	body := string(page.Body)
+	if !strings.Contains(body, "read -s") || !strings.Contains(body, "$CLIPROXY_BASE") {
+		t.Fatalf("page missing hidden-input instructions: %s", body)
+	}
+	if strings.Contains(body, "YOUR_API_KEY") {
+		t.Fatalf("page trains operators to paste secrets into commands: %s", body)
 	}
 }

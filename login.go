@@ -25,22 +25,32 @@ import (
 //
 //  1. StartLogin mints a random session and returns the URL of a kit-served
 //     login page: a browser-navigable resource route (GET, unauthenticated,
-//     served by the host at /v0/resource/plugins/<id>/login?state=...).
-//  2. The page carries no secrets. It shows a copy-paste curl command that
-//     POSTs the API key to a kit-served management route. The POST stays
+//     served by the host at /v0/resource/plugins/<id>/login?state=...). The
+//     URL keeps the host callback origin (a loopback address on a default
+//     host): a browser on the host machine opens it directly, while a remote
+//     operator swaps in the host's public base — the page path itself is
+//     origin-independent. The plugin cannot learn the public origin without
+//     a host change, so the returned URL stays absolute (non-browser clients
+//     need it) rather than root-relative.
+//  2. The page carries no secrets. It shows copy-paste shell commands that
+//     read the management key and the API key with hidden input and POST
+//     them to a kit-served management route, so neither secret lands in the
+//     command text, shell history, a URL, or a log line. The POST stays
 //     behind the host's existing management authentication, and the key
-//     travels in the JSON body only, never in a URL or log line. There is
-//     deliberately no HTML form: a browser cannot present management
-//     credentials on its own, and a form would train operators to paste
-//     their management key into a plugin-served page (the plugin would see
-//     that key in the request headers the host forwards).
+//     travels in the JSON body only. There is deliberately no HTML form: a
+//     browser cannot present management credentials on its own, and a form
+//     would train operators to paste their management key into a
+//     plugin-served page (the plugin would see that key in the request
+//     headers the host forwards).
 //  3. The submit handler runs the provider's full ParseAuth pipeline,
 //     including provider validation and the duplicate-key guard, against a
 //     deterministic file name derived from the key digest, so submitting the
 //     same key twice is idempotent instead of a duplicate. The validated
-//     AuthData is kept in the memory-only session; PollLogin returns it once
-//     and consumes the session. Raw keys are never written to disk by this
-//     flow and never leave the request body.
+//     AuthData is kept in the memory-only session; PollLogin delivers it to
+//     exactly one poller, then keeps a credential-free tombstone until expiry
+//     so a concurrent second poller waits instead of failing the host login.
+//     Raw keys are never written to disk by this flow and never leave the
+//     request body.
 //
 // Sessions are process-local with a TTL, so a plugin restart or expiry
 // surfaces as a poll error telling the operator to start a new login.
@@ -86,6 +96,12 @@ type loginSession struct {
 	auth      pluginapi.AuthData
 	auths     []pluginapi.AuthData
 	done      bool
+	// consumed marks a session whose credentials were already delivered to
+	// exactly one poller. The entry is kept until expiry so a concurrent
+	// second poller gets a harmless pending instead of an error that would
+	// poison the host login session; stored credentials are zeroed at once
+	// to preserve single delivery.
+	consumed bool
 }
 
 // APIKeyLogin serves one provider's API-key login flow. It implements the
@@ -214,7 +230,9 @@ func (l *APIKeyLogin) StartLogin(_ context.Context, req pluginapi.AuthLoginStart
 }
 
 // PollLogin reports pending until the submit endpoint completes the session,
-// then returns the validated AuthData once and consumes the session.
+// then delivers the validated AuthData to exactly one poller. A concurrent
+// second poller gets a credential-free pending (not an error) until the
+// consumed entry expires, so it cannot poison the host login session.
 func (l *APIKeyLogin) PollLogin(_ context.Context, req pluginapi.AuthLoginPollRequest) (pluginapi.AuthLoginPollResponse, error) {
 	if l == nil {
 		return pluginapi.AuthLoginPollResponse{}, rpcError("api_key_only", "API-key only: create an auth JSON file", 400)
@@ -227,11 +245,17 @@ func (l *APIKeyLogin) PollLogin(_ context.Context, req pluginapi.AuthLoginPollRe
 		delete(l.sessions, req.State)
 		return pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusError, Message: "login session expired or not found; start a new login"}, nil
 	}
+	if s.consumed {
+		return pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusPending, Message: "login was already collected by another poll; finishing"}, nil
+	}
 	if !s.done {
 		return pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusPending, Message: "waiting for the API key submission from " + s.pageURL}, nil
 	}
-	delete(l.sessions, req.State)
-	return pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusSuccess, Message: "login complete", Auth: s.auth, Auths: s.auths}, nil
+	auth, auths := s.auth, s.auths
+	s.consumed = true
+	s.auth = pluginapi.AuthData{}
+	s.auths = nil
+	return pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusSuccess, Message: "login complete", Auth: auth, Auths: auths}, nil
 }
 
 // RegisterManagement captures the host's route bases and declares the login
@@ -250,28 +274,23 @@ func (l *APIKeyLogin) RegisterManagement(_ context.Context, req pluginapi.Manage
 	l.mgmtBase = strings.TrimRight(base, "/")
 	l.resourceBase = strings.TrimRight(strings.TrimSpace(req.ResourceBasePath), "/")
 	l.mu.Unlock()
+	// Handlers stay nil on the wire: ManagementHandler is a non-empty
+	// interface, so any JSON value for it (including {}) fails to decode
+	// on the host (rpcPluginAdapter.RegisterManagement decodes into the
+	// SDK route structs) and no route would register. The host adapter
+	// assigns its own Handler after decoding; the kit dispatches incoming
+	// management.handle calls itself in HandleManagement below.
 	return pluginapi.ManagementRegistrationResponse{
 		Routes: []pluginapi.ManagementRoute{{
 			Method:      http.MethodPost,
 			Path:        loginSubmitPrefix + l.provider,
 			Description: "Submit an API key for a pending " + l.provider + " login started from the management UI.",
-			Handler:     loginRouteHandler{route: "submit"},
 		}},
 		Resources: []pluginapi.ResourceRoute{{
 			Path:        loginPageRoute,
 			Description: "Enter an API key to complete a pending login started from the management UI.",
-			Handler:     loginRouteHandler{route: "page"},
 		}},
 	}, nil
-}
-
-// loginRouteHandler marks a declared route for host-side normalization. The
-// host replaces it with the RPC adapter, so it is never invoked; the kit
-// dispatches management.handle itself in HandleManagement.
-type loginRouteHandler struct{ route string }
-
-func (loginRouteHandler) HandleManagement(context.Context, pluginapi.ManagementRequest) (pluginapi.ManagementResponse, error) {
-	return pluginapi.ManagementResponse{}, rpcError("unsupported_method", "login routes are served over RPC", 501)
 }
 
 // HandleManagement dispatches the declared routes by exact method and full
@@ -349,10 +368,16 @@ func (l *APIKeyLogin) servePage(req pluginapi.ManagementRequest) pluginapi.Manag
 		b.WriteString("<p>This login session expired or does not exist. In the management UI, click <b>Start " +
 			html.EscapeString(l.provider) + " Login</b> again to get a fresh login page.</p>")
 	} else {
-		b.WriteString("<p>Paste your API key into the command below and run it from any machine that reaches the CLIProxy host. The key travels in the POST body only.</p>")
-		b.WriteString("<pre>curl -X POST " + html.EscapeString(shellQuote(submitURL)) +
-			" \\\n  -H \"Authorization: Bearer $CLIPROXY_MANAGEMENT_KEY\" \\\n  -H 'Content-Type: application/json' \\\n  -d " +
-			html.EscapeString(shellQuote(`{"state":"`+state+`","api_key":"YOUR_API_KEY","label":"optional label"}`)) + "</pre>")
+		b.WriteString("<p>Run the commands below from any machine that reaches the CLIProxy host. " +
+			"Set CLIPROXY_BASE to the host's public base URL (for example http://host:port); " +
+			"the secrets are read with hidden input and never appear in the commands, shell history, URLs, or logs. " +
+			"The key travels in the POST body only.</p>")
+		submitCmd := "read -s -p 'Management key: ' CLIPROXY_MANAGEMENT_KEY; echo\n" +
+			"read -s -p '" + l.provider + " API key: ' PLUGIN_API_KEY; echo\n" +
+			`curl -X POST "$CLIPROXY_BASE` + submitURL + `" ` +
+			"\\\n  -H \"Authorization: Bearer $CLIPROXY_MANAGEMENT_KEY\" \\\n  -H 'Content-Type: application/json' \\\n" +
+			`  -d "$(printf '{"state":"` + state + `","api_key":"%s"}' "$PLUGIN_API_KEY")"`
+		b.WriteString("<pre>" + html.EscapeString(submitCmd) + "</pre>")
 		b.WriteString("<p>Keep polling this login in the management UI; it completes a few seconds after the POST succeeds. This page expires " +
 			html.EscapeString(s.expiresAt.UTC().Format(time.RFC3339)) + ".</p>")
 		if len(l.fields) > 0 {
@@ -377,13 +402,6 @@ func (l *APIKeyLogin) servePage(req pluginapi.ManagementRequest) pluginapi.Manag
 	b.WriteString("</body></html>")
 	return pluginapi.ManagementResponse{StatusCode: http.StatusOK,
 		Headers: http.Header{"Content-Type": {"text/html; charset=utf-8"}}, Body: []byte(b.String())}
-}
-
-func shellQuote(s string) string {
-	if s == "" {
-		return "''"
-	}
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // serveSubmit validates one key submission through the provider's ParseAuth
@@ -471,8 +489,20 @@ func (l *APIKeyLogin) serveSubmit(ctx context.Context, req pluginapi.ManagementR
 	if strings.TrimSpace(auth.Provider) == "" {
 		auth.Provider = l.provider
 	}
+	// Revalidate under the final lock: the session may have expired (or
+	// been evicted) while ParseAuth ran. Committing into a detached session
+	// would return success for a login that can never complete.
 	l.mu.Lock()
-	if current, ok := l.sessions[state]; ok && current == s {
+	current, ok := l.sessions[state]
+	switch {
+	case !ok || current != s:
+		l.mu.Unlock()
+		return loginJSONError(http.StatusBadRequest, "login_expired", "login session expired or not found; start a new login")
+	case !time.Now().Before(current.expiresAt):
+		delete(l.sessions, state)
+		l.mu.Unlock()
+		return loginJSONError(http.StatusBadRequest, "login_expired", "login session expired or not found; start a new login")
+	default:
 		s.auth, s.auths, s.done = auth, out.Auths, true
 	}
 	l.mu.Unlock()
