@@ -219,6 +219,39 @@ func TestLoginNormalizesBareRouteBases(t *testing.T) {
 	}
 }
 
+// TestRouteBaseRejectsHostile pins the shell-safety guard: the base lands
+// inside the operator's pasted shell block in double quotes, so shell
+// metacharacters are rejected to "" (StartLogin then fails login_unavailable
+// instead of serving a hostile block), as is a protocol-relative "//" base
+// that would resolve off-origin in the panel.
+func TestRouteBaseRejectsHostile(t *testing.T) {
+	for _, base := range []string{
+		`/v0/management"$(evil)"`,
+		"/v0/management`evil`",
+		"/v0/$management",
+		`/v0\management`,
+		"/v0/management\n松",
+		"/v0/management\revil",
+		"//evil.com/x",
+		"//",
+	} {
+		if got := routeBase(base); got != "" {
+			t.Errorf("routeBase(%q) = %q, want empty", base, got)
+		}
+	}
+	for base, want := range map[string]string{
+		"":                "",
+		"/":               "",
+		"v0/management":   "/v0/management",
+		"/v0/management/": "/v0/management",
+		"  /v0/m  ":       "/v0/m",
+	} {
+		if got := routeBase(base); got != want {
+			t.Errorf("routeBase(%q) = %q, want %q", base, got, want)
+		}
+	}
+}
+
 func TestLoginFullFlow(t *testing.T) {
 	r := loginRuntime(t, echoLogin(t))
 	start := startLogin(t, r)
@@ -411,6 +444,31 @@ func TestLoginScrubsLeakyProviderErrors(t *testing.T) {
 		Body: []byte(`{"state":"` + start.State + `","api_key":"example-key"}`)})
 	if resp.StatusCode != 400 || strings.Contains(string(resp.Body), "example-key") || !strings.Contains(string(resp.Body), "[redacted]") {
 		t.Fatalf("scrub %+v", resp)
+	}
+}
+
+// TestLoginScrubsEncodedKeyEchoes proves the scrub also catches recoverable
+// forms of the key: a provider echoing the URL-encoded or JSON-escaped key
+// must not leak it into the operator-facing error (and host logs).
+func TestLoginScrubsEncodedKeyEchoes(t *testing.T) {
+	const key = `a"b c/d`
+	leaky := func(_ context.Context, _ pluginapi.AuthParseRequest) (pluginapi.AuthParseResponse, error) {
+		return pluginapi.AuthParseResponse{}, &pluginabi.Error{Code: "upstream_says_no",
+			Message: `upstream rejected a%22b+c%2Fd and a\"b c/d as invalid`, HTTPStatus: 400}
+	}
+	login, err := NewAPIKeyLogin(APIKeyLoginConfig{Provider: "echo", Parse: leaky})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := loginRuntime(t, login)
+	start := startLogin(t, r)
+	resp := manage(t, r, pluginapi.ManagementRequest{Method: "POST", Path: loginSubmitPath,
+		Body: []byte(`{"state":"` + start.State + `","api_key":"` + loginJSONString(key) + `"}`)})
+	body := string(resp.Body)
+	if resp.StatusCode != 400 || strings.Contains(body, key) ||
+		strings.Contains(body, "a%22b+c%2Fd") || strings.Contains(body, `a\"b c/d`) ||
+		strings.Count(body, "[redacted]") != 2 {
+		t.Fatalf("encoded scrub %+v", resp)
 	}
 }
 

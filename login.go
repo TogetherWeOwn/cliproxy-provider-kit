@@ -368,10 +368,20 @@ func loginJSONError(status int, code, message string) pluginapi.ManagementRespon
 // panel's route path instead of its origin, failing exactly the remote
 // operators the relative URL is for. Empty stays empty so StartLogin keeps
 // failing with login_unavailable when routes were never registered.
+//
+// The base is interpolated into the operator's pasted shell block inside
+// double quotes, where ", `, $, and \ would break out and execute, and a
+// leading "//" would resolve as an off-origin URL in the panel. Legitimate
+// bases are plain path prefixes, so a base containing any of those (or a
+// newline) is rejected to "" and StartLogin fails with login_unavailable
+// instead of serving a hostile block.
 func routeBase(base string) string {
 	base = strings.TrimRight(strings.TrimSpace(base), "/")
 	if base != "" && !strings.HasPrefix(base, "/") {
 		base = "/" + base
+	}
+	if strings.ContainsAny(base, "\"`$\\\n\r") || strings.HasPrefix(base, "//") {
+		return ""
 	}
 	return base
 }
@@ -507,7 +517,7 @@ func (l *APIKeyLogin) servePage(req pluginapi.ManagementRequest) pluginapi.Manag
 			escVars = append(escVars, "ESC_"+strings.TrimPrefix(v, "PLUGIN_"))
 		}
 		var body strings.Builder
-		body.WriteString(`{"state":"` + state + `","api_key":"$ESC_API_KEY"`)
+		body.WriteString(`{"state":"` + loginJSONString(state) + `","api_key":"$ESC_API_KEY"`)
 		for i, f := range l.fields {
 			body.WriteString(`,"` + loginJSONString(f.Name) + `":"$` + escVars[i+1] + `"`)
 		}
@@ -632,6 +642,16 @@ func (l *APIKeyLogin) serveSubmit(ctx context.Context, req pluginapi.ManagementR
 		message := mapped.Message
 		if key != "" {
 			message = strings.ReplaceAll(message, key, "[redacted]")
+			// Providers may echo the key URL-encoded or JSON-escaped; scrub
+			// those recoverable forms too. The recipient already holds the
+			// key (they just typed it), so this keeps key material out of
+			// host and middleware response logs.
+			if enc := url.QueryEscape(key); enc != key {
+				message = strings.ReplaceAll(message, enc, "[redacted]")
+			}
+			if esc := loginJSONString(key); esc != key {
+				message = strings.ReplaceAll(message, esc, "[redacted]")
+			}
 		}
 		return loginJSONError(status, mapped.Code, message)
 	}
