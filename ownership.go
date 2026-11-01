@@ -45,10 +45,14 @@ func ProvisionalParseExpiry(ctx context.Context) (time.Time, bool) {
 }
 
 // KeyOwnership is the shared filename-ownership duplicate guard for
-// ParseAuth pipelines: one key digest may be configured in only one auth
-// filename at a time, so a duplicate file is rejected while a watcher's
-// repeated parse of the same file is safe. Only SHA-256 digests and
-// filenames are retained, never keys.
+// ParseAuth pipelines: one credential digest may be configured in only one
+// auth filename at a time, so a duplicate file is rejected while a
+// watcher's repeated parse of the same file is safe. The caller computes
+// the digest over its full credential identity — just the key when keys are
+// unique per account, or a composite such as account ID plus token when
+// one key may serve several accounts (the same split FilenameFields makes
+// for login file names). Only digests and filenames are retained, never
+// keys.
 //
 // A committed (host-initiated, non-provisional) parse records ownership
 // until the same filename is parsed with a different digest or the plugin
@@ -87,7 +91,9 @@ func duplicateAuthError() error {
 	return rpcError("duplicate_auth", "the same API key is already configured in another auth file", 400)
 }
 
-// Claim checks filename's ownership of digest and records it. For a
+// Claim checks fileName's ownership of digest and records it. digest is
+// caller-chosen: hash the full credential identity (key alone, or account
+// plus key for providers whose keys are shared across accounts). For a
 // provisional parse (ProvisionalParseExpiry reports true for ctx) the claim
 // is only reserved until the login session expires; any other parse commits
 // ownership. Claim returns a duplicate_auth error when another filename
