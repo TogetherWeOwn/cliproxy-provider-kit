@@ -137,7 +137,7 @@ func TestLoginFileNameDerivation(t *testing.T) {
 	}
 	name := func(candidate map[string]any) string {
 		t.Helper()
-		out, err := loginFileName("echo", "example-key", []string{"account_id", "region"}, candidate)
+		out, err := loginFileName("echo", "example-key", []loginFilenameField{{name: "account_id"}, {name: "region"}}, candidate)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -161,6 +161,96 @@ func TestLoginFileNameDerivation(t *testing.T) {
 	}
 	if strings.Contains(first, "example-key") || strings.Contains(first, "ac-1") {
 		t.Fatalf("filename leaks submitted values: %q", first)
+	}
+	// Without the fold, case spellings stay distinct (values are hashed as
+	// submitted); with LowercaseForFilename they converge on one identity.
+	if upper := name(map[string]any{"account_id": "AC-1", "region": "eu"}); upper == first {
+		t.Fatal("case folded without LowercaseForFilename")
+	}
+	folded, err := loginFileName("echo", "example-key",
+		[]loginFilenameField{{name: "account_id", lowercase: true}, {name: "region"}},
+		map[string]any{"account_id": " AC-1 ", "region": "eu"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if folded != first {
+		t.Fatalf("case spellings did not converge with LowercaseForFilename: %q != %q", folded, first)
+	}
+}
+
+// TestLoginFilenameLowercaseKeepsRepeatLoginIdempotent reproduces the
+// mixed-case repeat login end to end: the provider canonicalizes
+// account_id to lowercase during Parse (via Validate), keys its identity
+// on the canonical value, and rejects a second filename for that identity
+// as duplicate_auth. Mixed-case submissions must therefore mint one
+// filename when the field declares LowercaseForFilename; without the fold
+// the second submission below fails with duplicate_auth.
+func TestLoginFilenameLowercaseKeepsRepeatLoginIdempotent(t *testing.T) {
+	echoAuth := APIKeyAuth{Provider: "echo", Validate: func(fields map[string]any) error {
+		account, _ := fields["account_id"].(string)
+		fields["account_id"] = strings.ToLower(strings.TrimSpace(account))
+		return nil
+	}}
+	owners := map[string]string{}
+	var parsed []string
+	parse := func(ctx context.Context, req pluginapi.AuthParseRequest) (pluginapi.AuthParseResponse, error) {
+		parsed = append(parsed, req.FileName)
+		out, err := echoAuth.ParseAuth(ctx, req)
+		if err != nil || !out.Handled {
+			return out, err
+		}
+		var store map[string]any
+		if err := json.Unmarshal(out.Auth.StorageJSON, &store); err != nil {
+			return pluginapi.AuthParseResponse{}, err
+		}
+		identity := store["account_id"].(string) + "\x00" + store["api_key"].(string)
+		if file, ok := owners[identity]; ok && file != req.FileName {
+			return pluginapi.AuthParseResponse{}, &pluginabi.Error{Code: "duplicate_auth",
+				Message: "account and token already configured in another auth file", HTTPStatus: 400}
+		}
+		owners[identity] = req.FileName
+		return out, nil
+	}
+	login, err := NewAPIKeyLogin(APIKeyLoginConfig{Provider: "echo", Parse: parse,
+		Fields:         []APIKeyLoginField{{Name: "account_id", Label: "Account ID", Required: true, LowercaseForFilename: true}},
+		FilenameFields: []string{"account_id"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := loginRuntime(t, login)
+	submit := func(account string) string {
+		t.Helper()
+		start := startLogin(t, r)
+		resp := manage(t, r, pluginapi.ManagementRequest{Method: "POST", Path: loginSubmitPath,
+			Body: []byte(`{"state":"` + start.State + `","api_key":"example-key","account_id":"` + account + `"}`)})
+		if resp.StatusCode != 200 {
+			t.Fatalf("submit %q: %+v", account, resp)
+		}
+		env := rpc(t, r, "auth.login.poll", pluginapi.AuthLoginPollRequest{State: start.State})
+		if !env.OK {
+			t.Fatalf("poll: %+v", env.Error)
+		}
+		var out pluginapi.AuthLoginPollResponse
+		if err := json.Unmarshal(env.Result, &out); err != nil {
+			t.Fatal(err)
+		}
+		if out.Status != pluginapi.AuthLoginStatusSuccess {
+			t.Fatalf("poll %+v", out)
+		}
+		// The fold is filename-only: the stored value is exactly what the
+		// provider's own canonicalization produced from the submission.
+		var store map[string]any
+		if err := json.Unmarshal(out.Auth.StorageJSON, &store); err != nil || store["account_id"] != strings.ToLower(account) {
+			t.Fatalf("stored value not provider-canonicalized: %s", out.Auth.StorageJSON)
+		}
+		return out.Auth.FileName
+	}
+	upper, lower := submit("AC-1"), submit("ac-1")
+	if upper != lower {
+		t.Fatalf("case spellings minted two filenames: %q != %q", upper, lower)
+	}
+	if strings.Join(parsed, ",") != upper+","+lower {
+		t.Fatalf("Parse filenames %v", parsed)
 	}
 }
 

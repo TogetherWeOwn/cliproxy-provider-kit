@@ -110,6 +110,16 @@ type APIKeyLoginField struct {
 	// analytics key) so they never echo while typed. Secret values are
 	// also scrubbed from provider error messages, like the API key.
 	Secret bool
+	// LowercaseForFilename lower-cases the submitted value before it joins
+	// the FilenameFields digest, without changing the value handed to
+	// Parse. Set it when the field is also in FilenameFields and the
+	// provider's identity is case-insensitive for it (for example a hex
+	// account ID that Parse canonicalizes to lowercase): otherwise two
+	// case spellings of one identity would mint different file names while
+	// sharing the provider's canonical identity, and a repeat login would
+	// trip the duplicate guard instead of staying idempotent. It has no
+	// effect for fields not listed in FilenameFields.
+	LowercaseForFilename bool
 }
 
 // APIKeyLoginConfig wires provider behavior into the login helper.
@@ -135,9 +145,10 @@ type APIKeyLoginConfig struct {
 	// ParseAuth would overwrite the first identity's ownership entry.
 	// Empty (the default) keeps the historical key-only derivation, so
 	// existing providers' file names are unchanged. Values are hashed as
-	// submitted (strings trimmed); provider-side normalization inside Parse
-	// (such as lower-casing) is not reflected, so identity fields should be
-	// submitted in canonical form. A listed optional field that is omitted
+	// submitted (strings trimmed, plus lower-cased for fields declaring
+	// LowercaseForFilename); other provider-side normalization inside Parse
+	// is not reflected, so identity fields should be submitted in canonical
+	// form or declare the case fold. A listed optional field that is omitted
 	// or blank contributes no value. Providers using FilenameFields
 	// should also derive distinct Auth IDs for distinct identities in Parse.
 	FilenameFields []string
@@ -163,11 +174,18 @@ type loginSession struct {
 // StartLogin/PollLogin half of pluginapi.AuthProvider (wired through
 // APIKeyAuth.Login) and the pluginapi.ManagementAPI plus
 // pluginapi.ManagementHandler halves for Capabilities.ManagementAPI.
+// loginFilenameField is one resolved FilenameFields entry: the declared
+// field name plus whether its value is lower-cased before hashing.
+type loginFilenameField struct {
+	name      string
+	lowercase bool
+}
+
 type APIKeyLogin struct {
 	provider       string
 	parse          func(context.Context, pluginapi.AuthParseRequest) (pluginapi.AuthParseResponse, error)
 	fields         []APIKeyLoginField
-	filenameFields []string
+	filenameFields []loginFilenameField
 	byName         map[string]APIKeyLoginField
 	ttl            time.Duration
 
@@ -230,21 +248,22 @@ func NewAPIKeyLogin(cfg APIKeyLoginConfig) (*APIKeyLogin, error) {
 	// value and would silently keep the colliding key-only derivation.
 	// api_key is rejected rather than ignored because it is always part of
 	// the derivation; listing it would suggest it is somehow optional.
-	filenameFields := make([]string, 0, len(cfg.FilenameFields))
+	filenameFields := make([]loginFilenameField, 0, len(cfg.FilenameFields))
 	seenFilenameFields := make(map[string]bool, len(cfg.FilenameFields))
 	for _, rawName := range cfg.FilenameFields {
 		name := strings.TrimSpace(rawName)
 		if name == "api_key" {
 			return nil, rpcError("invalid_login", "api_key is always a login filename input and must not be listed in FilenameFields", 500)
 		}
-		if _, ok := byName[name]; !ok {
+		field, ok := byName[name]
+		if !ok {
 			return nil, rpcError("invalid_login", "login filename field must name a declared login field", 500)
 		}
 		if seenFilenameFields[name] {
 			return nil, rpcError("invalid_login", "duplicate login filename field", 500)
 		}
 		seenFilenameFields[name] = true
-		filenameFields = append(filenameFields, name)
+		filenameFields = append(filenameFields, loginFilenameField{name: name, lowercase: field.LowercaseForFilename})
 	}
 	ttl := cfg.SessionTTL
 	if ttl <= 0 {
@@ -262,30 +281,34 @@ func NewAPIKeyLogin(cfg APIKeyLoginConfig) (*APIKeyLogin, error) {
 // loginFileName derives the deterministic auth file name for one login
 // identity. With no filename fields it is the historical key-only digest, so
 // existing providers keep their current file names. With filename fields,
-// each field's name and JSON-encoded submitted value (strings trimmed, an
-// omitted optional field as JSON null) is hashed after the key with NUL
-// separators, so distinct identities that share a key mint distinct names
-// and no split of values across fields can alias another identity. The
-// digest is truncated exactly like the key-only form, and neither the key
-// nor any field value appears in the name.
-func loginFileName(provider, key string, filenameFields []string, candidate map[string]any) (string, error) {
+// each field's name and JSON-encoded submitted value (strings trimmed, and
+// lower-cased when the field declares it; an omitted optional field as JSON
+// null) is hashed after the key with NUL separators, so distinct identities
+// that share a key mint distinct names and no split of values across fields
+// can alias another identity. The digest is truncated exactly like the
+// key-only form, and neither the key nor any field value appears in the name.
+func loginFileName(provider, key string, filenameFields []loginFilenameField, candidate map[string]any) (string, error) {
 	if len(filenameFields) == 0 {
 		digest := sha256.Sum256([]byte(key))
 		return provider + "-" + hex.EncodeToString(digest[:6]) + ".json", nil
 	}
 	h := sha256.New()
 	h.Write([]byte(key))
-	for _, name := range filenameFields {
-		value := candidate[name]
+	for _, field := range filenameFields {
+		value := candidate[field.name]
 		if s, ok := value.(string); ok {
-			value = strings.TrimSpace(s)
+			s = strings.TrimSpace(s)
+			if field.lowercase {
+				s = strings.ToLower(s)
+			}
+			value = s
 		}
 		raw, err := json.Marshal(value)
 		if err != nil {
 			return "", err
 		}
 		h.Write([]byte{0})
-		h.Write([]byte(name))
+		h.Write([]byte(field.name))
 		h.Write([]byte{0})
 		h.Write(raw)
 	}
