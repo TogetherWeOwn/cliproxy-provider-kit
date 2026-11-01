@@ -159,6 +159,66 @@ func TestLoginStartRequiresRegistration(t *testing.T) {
 	}
 }
 
+// TestLoginRejectsEmptyResourceBase pins the only remaining StartLogin
+// failure mode: registration without a resource base (routes never
+// registered) keeps failing with login_unavailable.
+func TestLoginRejectsEmptyResourceBase(t *testing.T) {
+	login := echoLogin(t)
+	r := newRuntime(t, Definition{Metadata: metadata(), Capabilities: pluginapi.Capabilities{
+		AuthProvider: APIKeyAuth{Provider: "echo", Login: login}, ManagementAPI: login}}, nil)
+	register(t, r)
+	env := rpc(t, r, "management.register", pluginapi.ManagementRegistrationRequest{
+		BasePath: "/v0/management", ResourceBasePath: ""})
+	if !env.OK {
+		t.Fatalf("register management: %+v", env.Error)
+	}
+	if env := rpc(t, r, "auth.login.start", pluginapi.AuthLoginStartRequest{BaseURL: loginBaseURL}); env.OK || env.Error.Code != "login_unavailable" {
+		t.Fatalf("empty resource base start: %+v", env)
+	}
+}
+
+// TestLoginNormalizesBareRouteBases proves bases without a leading slash
+// still yield root-relative page URLs and a management-base submit block: a
+// bare "v0/..." URL would resolve against the panel's route path instead of
+// its origin. It also pins the two-base split (page served from the resource
+// base, key posted to the management base) and distinct consecutive states.
+func TestLoginNormalizesBareRouteBases(t *testing.T) {
+	login := echoLogin(t)
+	r := newRuntime(t, Definition{Metadata: metadata(), Capabilities: pluginapi.Capabilities{
+		AuthProvider: APIKeyAuth{Provider: "echo", Login: login}, ManagementAPI: login}}, nil)
+	register(t, r)
+	env := rpc(t, r, "management.register", pluginapi.ManagementRegistrationRequest{
+		BasePath: "v0/management", ResourceBasePath: "v0/resource/plugins/echo-id"})
+	if !env.OK {
+		t.Fatalf("register management: %+v", env.Error)
+	}
+	var first pluginapi.AuthLoginStartResponse
+	for i := 0; i < 2; i++ {
+		env := rpc(t, r, "auth.login.start", pluginapi.AuthLoginStartRequest{BaseURL: loginBaseURL})
+		if !env.OK {
+			t.Fatalf("start: %+v", env)
+		}
+		var resp pluginapi.AuthLoginStartResponse
+		if err := json.Unmarshal(env.Result, &resp); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.HasPrefix(resp.URL, "/v0/resource/plugins/echo-id/login?state=") || strings.Contains(resp.URL, "://") {
+			t.Fatalf("page url %q", resp.URL)
+		}
+		if i == 0 {
+			first = resp
+		} else if resp.State == first.State || resp.URL == first.URL {
+			t.Fatalf("states not distinct: %+v %+v", first, resp)
+		}
+	}
+	page := manage(t, r, pluginapi.ManagementRequest{Method: "GET",
+		Path: "/v0/resource/plugins/echo-id/login", Query: map[string][]string{"state": {first.State}}})
+	// Quotes are HTML-escaped in the raw body; the path itself is not.
+	if page.StatusCode != 200 || !strings.Contains(string(page.Body), "$CLIPROXY_BASE/v0/management/plugin-login/echo") {
+		t.Fatalf("page posts to the wrong base: %+v", page.StatusCode)
+	}
+}
+
 func TestLoginFullFlow(t *testing.T) {
 	r := loginRuntime(t, echoLogin(t))
 	start := startLogin(t, r)

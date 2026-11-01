@@ -299,8 +299,8 @@ func (l *APIKeyLogin) RegisterManagement(_ context.Context, req pluginapi.Manage
 		base = defaultManagementBase
 	}
 	l.mu.Lock()
-	l.mgmtBase = strings.TrimRight(base, "/")
-	l.resourceBase = strings.TrimRight(strings.TrimSpace(req.ResourceBasePath), "/")
+	l.mgmtBase = routeBase(strings.TrimSpace(base))
+	l.resourceBase = routeBase(strings.TrimSpace(req.ResourceBasePath))
 	l.mu.Unlock()
 	// Handlers stay nil on the wire: ManagementHandler is a non-empty
 	// interface, so any JSON value for it (including {}) fails to decode
@@ -360,6 +360,20 @@ func loginJSON(status int, v any) pluginapi.ManagementResponse {
 
 func loginJSONError(status int, code, message string) pluginapi.ManagementResponse {
 	return loginJSON(status, map[string]any{"error": map[string]any{"code": code, "message": message}})
+}
+
+// routeBase normalizes a host route base to a root-relative path: trimmed,
+// no trailing slash, always starting with "/". A base without a leading slash
+// would make StartLogin return a relative URL that resolves against the
+// panel's route path instead of its origin, failing exactly the remote
+// operators the relative URL is for. Empty stays empty so StartLogin keeps
+// failing with login_unavailable when routes were never registered.
+func routeBase(base string) string {
+	base = strings.TrimRight(strings.TrimSpace(base), "/")
+	if base != "" && !strings.HasPrefix(base, "/") {
+		base = "/" + base
+	}
+	return base
 }
 
 func (l *APIKeyLogin) lookup(state string) *loginSession {
