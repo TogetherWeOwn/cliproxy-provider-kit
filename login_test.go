@@ -3,6 +3,8 @@ package providerkit
 import (
 	"context"
 	"encoding/json"
+	"html"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -78,6 +80,7 @@ func TestLoginConfigValidation(t *testing.T) {
 		"reserved field":  {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "api_key"}}},
 		"duplicate field": {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "x"}, {Name: "x"}}},
 		"reserved id":     {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "id"}}},
+		"shell collision": {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "a-b"}, {Name: "a_b"}}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := NewAPIKeyLogin(cfg); err == nil {
@@ -460,11 +463,158 @@ func TestLoginPageKeepsSecretsOutOfCommands(t *testing.T) {
 	if page.StatusCode != 200 {
 		t.Fatalf("page %+v", page)
 	}
-	body := string(page.Body)
+	// The command is HTML-escaped inside <pre>: check the pasted text.
+	body := html.UnescapeString(string(page.Body))
 	if !strings.Contains(body, "read -s") || !strings.Contains(body, "$CLIPROXY_BASE") {
 		t.Fatalf("page missing hidden-input instructions: %s", body)
 	}
 	if strings.Contains(body, "YOUR_API_KEY") {
 		t.Fatalf("page trains operators to paste secrets into commands: %s", body)
+	}
+	// Secrets travel over stdin only: the bearer header in a
+	// process-substitution file, the JSON body in a heredoc. Neither may
+	// appear as a curl argument, where ps and /proc could see it.
+	for _, want := range []string{"-H @<(", "--data-binary @-", "<<EOF", "unset CLIPROXY_MANAGEMENT_KEY"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("page missing stdin secret transport %q: %s", want, body)
+		}
+	}
+	for _, banned := range []string{`-d "$(printf`, `-H "Authorization: Bearer $`, "read -s -p"} {
+		if strings.Contains(body, banned) {
+			t.Fatalf("page leaks secrets into process arguments or uses bash-only read flags %q: %s", banned, body)
+		}
+	}
+	// Prompts stay portable: printf carries the prompt (zsh rejects read -p)
+	// and values are shell-escaped with builtins before reaching curl.
+	for _, want := range []string{"printf 'Management key: '; read -s", "${PLUGIN_API_KEY//\\\\/\\\\\\\\}"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("page missing portable prompt or builtin escaping %q: %s", want, body)
+		}
+	}
+}
+
+func TestLoginPageIncludesRequiredFields(t *testing.T) {
+	echoAuth := APIKeyAuth{Provider: "echo"}
+	login, err := NewAPIKeyLogin(APIKeyLoginConfig{Provider: "echo", Parse: echoAuth.ParseAuth,
+		Fields: []APIKeyLoginField{
+			{Name: "account_id", Label: "Account ID", Description: "Cloudflare account", Required: true},
+			{Name: "note", Label: "Note"},
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := loginRuntime(t, login)
+	start := startLogin(t, r)
+	page := manage(t, r, pluginapi.ManagementRequest{Method: "GET", Path: loginResourceBase + "/login",
+		Query: map[string][]string{"state": {start.State}}})
+	if page.StatusCode != 200 {
+		t.Fatalf("page %+v", page)
+	}
+	// The command is HTML-escaped inside <pre>: check the pasted text.
+	body := html.UnescapeString(string(page.Body))
+	// Every declared field is prompted for and lands in the JSON body, so a
+	// verbatim run cannot fail with "missing required field".
+	for _, want := range []string{
+		"read PLUGIN_FIELD_ACCOUNT_ID",
+		"read PLUGIN_FIELD_NOTE",
+		`"account_id":"$ESC_FIELD_ACCOUNT_ID"`,
+		`"note":"$ESC_FIELD_NOTE"`,
+		"Account ID (required)",
+		"Note (optional)",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("page missing required-field wiring %q: %s", want, body)
+		}
+	}
+	if strings.Contains(body, "Optional provider fields") {
+		t.Fatalf("page mislabels a section with required fields as optional: %s", body)
+	}
+	// A blank required answer is a missing field; a blank optional is skipped.
+	blankRequired := manage(t, r, pluginapi.ManagementRequest{Method: "POST", Path: loginSubmitPath,
+		Body: []byte(`{"state":"` + start.State + `","api_key":"example-key","account_id":" "}`)})
+	if blankRequired.StatusCode != 400 || !strings.Contains(string(blankRequired.Body), "missing required field") {
+		t.Fatalf("blank required accepted: %+v", blankRequired)
+	}
+	blankOptional := manage(t, r, pluginapi.ManagementRequest{Method: "POST", Path: loginSubmitPath,
+		Body: []byte(`{"state":"` + start.State + `","api_key":"example-key","account_id":"ac-1","note":""}`)})
+	if blankOptional.StatusCode != 200 {
+		t.Fatalf("blank optional rejected: %+v", blankOptional)
+	}
+	env := rpc(t, r, "auth.login.poll", pluginapi.AuthLoginPollRequest{State: start.State})
+	if !env.OK {
+		t.Fatalf("poll: %+v", env.Error)
+	}
+	var out pluginapi.AuthLoginPollResponse
+	if err := json.Unmarshal(env.Result, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != pluginapi.AuthLoginStatusSuccess {
+		t.Fatalf("poll %+v", out)
+	}
+	var store map[string]any
+	if err := json.Unmarshal(out.Auth.StorageJSON, &store); err != nil {
+		t.Fatal(err)
+	}
+	if store["account_id"] != "ac-1" {
+		t.Fatalf("required field lost: %s", out.Auth.StorageJSON)
+	}
+	if _, ok := store["note"]; ok {
+		t.Fatalf("blank optional stored as empty: %s", out.Auth.StorageJSON)
+	}
+}
+
+func TestLoginResubmitAfterConsumedIsRejected(t *testing.T) {
+	r := loginRuntime(t, echoLogin(t))
+	start := startLogin(t, r)
+	if resp := manage(t, r, pluginapi.ManagementRequest{Method: "POST", Path: loginSubmitPath,
+		Body: []byte(`{"state":"` + start.State + `","api_key":"example-key"}`)}); resp.StatusCode != 200 {
+		t.Fatalf("submit %+v", resp)
+	}
+	env := rpc(t, r, "auth.login.poll", pluginapi.AuthLoginPollRequest{State: start.State})
+	if !env.OK {
+		t.Fatalf("poll: %+v", env.Error)
+	}
+	var out pluginapi.AuthLoginPollResponse
+	if err := json.Unmarshal(env.Result, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != pluginapi.AuthLoginStatusSuccess {
+		t.Fatalf("poll %+v", out)
+	}
+	// The login was already collected: a second POST must fail loudly instead
+	// of storing a key the operator believes is live.
+	again := manage(t, r, pluginapi.ManagementRequest{Method: "POST", Path: loginSubmitPath,
+		Body: []byte(`{"state":"` + start.State + `","api_key":"other-key"}`)})
+	if again.StatusCode != http.StatusConflict || !strings.Contains(string(again.Body), "login_completed") {
+		t.Fatalf("consumed resubmit not rejected: %+v", again)
+	}
+}
+
+func TestLoginSpecialCharacterKey(t *testing.T) {
+	r := loginRuntime(t, echoLogin(t))
+	start := startLogin(t, r)
+	// A key with JSON-significant characters must survive the round trip: the
+	// page shell-escapes it with builtins, and the endpoint stores it verbatim.
+	key := `ab"cd\ef`
+	submit, err := json.Marshal(map[string]any{"state": start.State, "api_key": key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp := manage(t, r, pluginapi.ManagementRequest{Method: "POST", Path: loginSubmitPath, Body: submit}); resp.StatusCode != 200 {
+		t.Fatalf("special-char submit %+v", resp)
+	}
+	env := rpc(t, r, "auth.login.poll", pluginapi.AuthLoginPollRequest{State: start.State})
+	if !env.OK {
+		t.Fatalf("poll: %+v", env.Error)
+	}
+	var out pluginapi.AuthLoginPollResponse
+	if err := json.Unmarshal(env.Result, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != pluginapi.AuthLoginStatusSuccess {
+		t.Fatalf("poll %+v", out)
+	}
+	if got, err := APIKey(out.Auth.StorageJSON, nil); err != nil || got != key {
+		t.Fatalf("stored %q want %q (err %v)", got, key, err)
 	}
 }

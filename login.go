@@ -35,7 +35,14 @@ import (
 //  2. The page carries no secrets. It shows copy-paste shell commands that
 //     read the management key and the API key with hidden input and POST
 //     them to a kit-served management route, so neither secret lands in the
-//     command text, shell history, a URL, or a log line. The POST stays
+//     pasted command text, shell history, a URL, or a log line. Both secrets
+//     also stay out of process arguments: the bearer header travels in a
+//     process-substitution file and the JSON body over stdin (heredoc), so
+//     `ps` and /proc show only file descriptors and `-` instead of the key.
+//     The page prompts for every declared provider field (at minimum the
+//     required ones) and shell-escapes each value with builtins only, so
+//     quotes, backslashes, and newlines cannot corrupt the JSON body. The
+//     POST stays
 //     behind the host's existing management authentication, and the key
 //     travels in the JSON body only. There is deliberately no HTML form: a
 //     browser cannot present management credentials on its own, and a form
@@ -151,6 +158,17 @@ func NewAPIKeyLogin(cfg APIKeyLoginConfig) (*APIKeyLogin, error) {
 		}
 		f.Name = name
 		byName[name] = f
+	}
+	// The login page maps each field to a PLUGIN_FIELD_<NAME> shell variable.
+	// Two fields that sanitize to the same variable would overwrite each
+	// other in the operator's shell, so reject the config here.
+	seenVars := make(map[string]string, len(cfg.Fields))
+	for _, f := range cfg.Fields {
+		v := loginShellVar(strings.TrimSpace(f.Name))
+		if prev, dup := seenVars[v]; dup {
+			return nil, rpcError("invalid_login", "login fields "+prev+" and "+strings.TrimSpace(f.Name)+" share a shell variable", 500)
+		}
+		seenVars[v] = strings.TrimSpace(f.Name)
 	}
 	ttl := cfg.SessionTTL
 	if ttl <= 0 {
@@ -346,9 +364,56 @@ func (l *APIKeyLogin) lookup(state string) *loginSession {
 	return s
 }
 
+// loginShellVar maps a provider field name to the PLUGIN_FIELD_<NAME> shell
+// variable the login page reads it into. Names are upper-cased and anything
+// outside [A-Z0-9] becomes "_"; NewAPIKeyLogin rejects fields that collide.
+func loginShellVar(name string) string {
+	var b strings.Builder
+	b.WriteString("PLUGIN_FIELD_")
+	for _, r := range strings.ToUpper(name) {
+		if (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		} else {
+			b.WriteRune('_')
+		}
+	}
+	return b.String()
+}
+
+// loginShellSingle quotes text for embedding in a single-quoted shell string
+// (prompts carry provider and field names, which the config does not constrain
+// to shell-safe characters).
+func loginShellSingle(s string) string {
+	return strings.ReplaceAll(s, "'", `'\''`)
+}
+
+// loginEscapeLine emits one bash/zsh line that copies VAR into ESC with
+// JSON-safe escaping (backslash, double quote, newline, CR, tab). Every
+// expansion is a shell builtin, so the values never appear in a child
+// process's arguments; the failure mode without it is a safe 400 from the
+// submit endpoint, never a wrong key.
+func loginEscapeLine(varName, escName string) string {
+	return escName + "=${" + varName + "//\\\\/\\\\\\\\}; " +
+		escName + "=${" + escName + "//\\\"/\\\\\\\"}; " +
+		escName + "=${" + escName + "//$'\\n'/\\\\n}; " +
+		escName + "=${" + escName + "//$'\\r'/\\\\r}; " +
+		escName + "=${" + escName + "//$'\\t'/\\\\t}"
+}
+
+// loginJSONString escapes a server-side string (a declared field name) for
+// embedding in the page's JSON body template.
+func loginJSONString(s string) string {
+	r := strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`, "\r", `\r`, "\t", `\t`)
+	return r.Replace(s)
+}
+
 // servePage renders the login page for a pending session. The page holds the
-// session state and a copy-paste curl command only; the API key and the
+// session state and a copy-paste shell block only; the API key and the
 // management key are typed into the operator's terminal, never into this page.
+// The block is written for bash and zsh (prompt via printf, hidden input via
+// read -s): both secrets travel over stdin — the bearer header in a
+// process-substitution file, the JSON body in a heredoc — so neither appears
+// in process arguments, shell history, a URL, or a log line.
 func (l *APIKeyLogin) servePage(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
 	l.mu.Lock()
 	mgmtBase := l.mgmtBase
@@ -368,20 +433,59 @@ func (l *APIKeyLogin) servePage(req pluginapi.ManagementRequest) pluginapi.Manag
 		b.WriteString("<p>This login session expired or does not exist. In the management UI, click <b>Start " +
 			html.EscapeString(l.provider) + " Login</b> again to get a fresh login page.</p>")
 	} else {
-		b.WriteString("<p>Run the commands below from any machine that reaches the CLIProxy host. " +
-			"Set CLIPROXY_BASE to the host's public base URL (for example http://host:port); " +
-			"the secrets are read with hidden input and never appear in the commands, shell history, URLs, or logs. " +
+		b.WriteString("<p>Paste the block below into <b>bash or zsh</b> on any machine that reaches the CLIProxy host. " +
+			"Set CLIPROXY_BASE to the host's public base URL (for example http://host:port). " +
+			"The secrets are read with hidden input and travel over stdin only: they never appear in the pasted text, " +
+			"shell history, process arguments, URLs, or logs. " +
 			"The key travels in the POST body only.</p>")
-		submitCmd := "read -s -p 'Management key: ' CLIPROXY_MANAGEMENT_KEY; echo\n" +
-			"read -s -p '" + l.provider + " API key: ' PLUGIN_API_KEY; echo\n" +
-			`curl -X POST "$CLIPROXY_BASE` + submitURL + `" ` +
-			"\\\n  -H \"Authorization: Bearer $CLIPROXY_MANAGEMENT_KEY\" \\\n  -H 'Content-Type: application/json' \\\n" +
-			`  -d "$(printf '{"state":"` + state + `","api_key":"%s"}' "$PLUGIN_API_KEY")"`
-		b.WriteString("<pre>" + html.EscapeString(submitCmd) + "</pre>")
-		b.WriteString("<p>Keep polling this login in the management UI; it completes a few seconds after the POST succeeds. This page expires " +
+		var cmd strings.Builder
+		cmd.WriteString("printf 'Management key: '; read -s CLIPROXY_MANAGEMENT_KEY; echo\n")
+		cmd.WriteString("printf '" + loginShellSingle(l.provider) + " API key: '; read -s PLUGIN_API_KEY; echo\n")
+		for _, f := range l.fields {
+			prompt := strings.TrimSpace(f.Label)
+			if prompt == "" {
+				prompt = f.Name
+			}
+			if f.Required {
+				prompt += " (required)"
+			} else {
+				prompt += " (optional)"
+			}
+			cmd.WriteString("printf '" + loginShellSingle(prompt) + ": '; read " + loginShellVar(f.Name) + "; echo\n")
+		}
+		// Header values must not span lines: strip CR/LF from the management
+		// key with builtins before it reaches the header file. The header
+		// takes the raw key (no JSON escaping); the body takes the escaped
+		// copies below.
+		cmd.WriteString("CLEAN_MGMT=${CLIPROXY_MANAGEMENT_KEY//$'\\n'/}; CLEAN_MGMT=${CLEAN_MGMT//$'\\r'/}\n")
+		cmd.WriteString(loginEscapeLine("PLUGIN_API_KEY", "ESC_API_KEY") + "\n")
+		escVars := []string{"ESC_API_KEY"}
+		for _, f := range l.fields {
+			v := loginShellVar(f.Name)
+			cmd.WriteString(loginEscapeLine(v, "ESC_"+strings.TrimPrefix(v, "PLUGIN_")) + "\n")
+			escVars = append(escVars, "ESC_"+strings.TrimPrefix(v, "PLUGIN_"))
+		}
+		var body strings.Builder
+		body.WriteString(`{"state":"` + state + `","api_key":"$ESC_API_KEY"`)
+		for i, f := range l.fields {
+			body.WriteString(`,"` + loginJSONString(f.Name) + `":"$` + escVars[i+1] + `"`)
+		}
+		body.WriteString("}")
+		cmd.WriteString(`curl -X POST "$CLIPROXY_BASE` + submitURL + `" ` +
+			"\\\n  -H @<(printf '%s' \"Authorization: Bearer $CLEAN_MGMT\") \\\n  -H 'Content-Type: application/json' \\\n" +
+			"  --data-binary @- <<EOF\n" + body.String() + "\nEOF\n")
+		unset := "unset CLIPROXY_MANAGEMENT_KEY PLUGIN_API_KEY CLEAN_MGMT ESC_API_KEY"
+		for _, f := range l.fields {
+			v := loginShellVar(f.Name)
+			unset += " " + v + " ESC_" + strings.TrimPrefix(v, "PLUGIN_")
+		}
+		cmd.WriteString(unset)
+		b.WriteString("<pre>" + html.EscapeString(cmd.String()) + "</pre>")
+		b.WriteString("<p>Leave optional fields blank to skip them. Keep polling this login in the management UI; " +
+			"it completes a few seconds after the POST succeeds. This page expires " +
 			html.EscapeString(s.expiresAt.UTC().Format(time.RFC3339)) + ".</p>")
 		if len(l.fields) > 0 {
-			b.WriteString("<h2>Optional provider fields</h2><ul>")
+			b.WriteString("<h2>Provider fields</h2><ul>")
 			for _, f := range l.fields {
 				item := html.EscapeString(f.Name)
 				if strings.TrimSpace(f.Label) != "" {
@@ -392,6 +496,8 @@ func (l *APIKeyLogin) servePage(req pluginapi.ManagementRequest) pluginapi.Manag
 				}
 				if f.Required {
 					item += " <b>(required)</b>"
+				} else {
+					item += " (optional)"
 				}
 				b.WriteString("<li>" + item + "</li>")
 			}
@@ -440,8 +546,18 @@ func (l *APIKeyLogin) serveSubmit(ctx context.Context, req pluginapi.ManagementR
 				candidate[name] = value
 			}
 		default:
-			if _, ok := l.byName[name]; !ok {
+			f, ok := l.byName[name]
+			if !ok {
 				return loginJSONError(http.StatusBadRequest, "invalid_request", "unknown auth field "+name)
+			}
+			// A blank prompt answer for an optional field means "skip it":
+			// omit it instead of storing an empty string. A blank required
+			// field is a missing field.
+			if str, isStr := value.(string); isStr && strings.TrimSpace(str) == "" {
+				if f.Required {
+					return loginJSONError(http.StatusBadRequest, "invalid_auth", "missing required field "+f.Name)
+				}
+				continue
 			}
 			candidate[name] = value
 		}
@@ -502,6 +618,12 @@ func (l *APIKeyLogin) serveSubmit(ctx context.Context, req pluginapi.ManagementR
 		delete(l.sessions, state)
 		l.mu.Unlock()
 		return loginJSONError(http.StatusBadRequest, "login_expired", "login session expired or not found; start a new login")
+	case current.consumed:
+		// The host already collected this login: a second POST cannot be
+		// delivered (the poller gets pending until expiry), so fail loudly
+		// instead of storing a key the operator thinks is live.
+		l.mu.Unlock()
+		return loginJSONError(http.StatusConflict, "login_completed", "this login was already completed; start a new login")
 	default:
 		s.auth, s.auths, s.done = auth, out.Auths, true
 	}
