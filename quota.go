@@ -207,19 +207,19 @@ func (q *CachedQuota) ResetQuota(context.Context, pluginapi.QuotaResetRequest) (
 // only where they add information (for example, "Weekly key limit · $5.00 of
 // $5.00 left").
 //
-// Only the listed spellings canonicalize; anything else (including typos and
-// the empty string) passes through verbatim after trimming, so callers must
-// spell windows deliberately.
+// Only the listed spellings canonicalize to the CardWindow* constants;
+// anything else (including typos and the empty string) passes through
+// verbatim after trimming, so callers must spell windows deliberately.
 func QuotaWindowLabel(window string) string {
 	switch strings.ToLower(strings.TrimSpace(window)) {
 	case "5h", "five-hour", "five_hour", "5-hour", "5-hour limit":
-		return "5-hour limit"
+		return CardWindowFiveHour
 	case "weekly", "week", "weekly limit":
-		return "Weekly limit"
+		return CardWindowWeekly
 	case "monthly", "month", "monthly limit":
-		return "Monthly limit"
+		return CardWindowMonthly
 	case "daily", "day", "daily limit":
-		return "Daily limit"
+		return CardWindowDaily
 	default:
 		return strings.TrimSpace(window)
 	}
