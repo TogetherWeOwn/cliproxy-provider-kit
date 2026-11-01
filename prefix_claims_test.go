@@ -66,14 +66,24 @@ func TestPrefixClaimsRotationAndRelease(t *testing.T) {
 func TestPrefixClaimsUnpinnedSharing(t *testing.T) {
 	var claims PrefixClaims
 	// Empty prefixes are the normal unpinned state: any number of files may
-	// share them, as may slash-bearing prefixes the host normalizes to "".
+	// share them.
 	for _, file := range []string{"a.json", "b.json", "c.json"} {
 		if err := claims.Claim(file, "", []byte("key-"+file)); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := claims.Claim("d.json", "has/slash", []byte("key-d")); err != nil {
-		t.Fatalf("slash prefix should normalize to unpinned: %v", err)
+	// Leading/trailing slashes normalize like the filestore: "acct/" claims "acct".
+	if err := claims.Claim("d.json", "acct/", []byte("key-d")); err != nil {
+		t.Fatal(err)
+	}
+	if err := claims.Claim("e.json", "acct", []byte("key-e")); MapError(err).Code != "duplicate_prefix" {
+		t.Fatalf("normalized prefix collision accepted: %v", err)
+	}
+	// An inner slash can never be unpinned: the host pins it verbatim on the
+	// plugin path, so claiming it must fail loudly instead of silently sharing
+	// the unpinned namespace.
+	if err := claims.Claim("f.json", "has/slash", []byte("key-f")); MapError(err).Code != "invalid_auth" {
+		t.Fatalf("slash prefix accepted: %v", err)
 	}
 }
 

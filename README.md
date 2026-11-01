@@ -83,7 +83,7 @@ One object per account, using the provider key as top-level `type`:
 
 Create real auth files privately with mode `0600`; never commit them. The default ID is `provider:` plus the first 12 hex characters of SHA-256 of the trimmed API key, or an explicit string `id`. Changing filename does not change identity; duplicate files with the same key derive the same identity. Account/file deduplication and rejection policy belong to provider repos, not this stateless parser.
 
-Storage remains a JSON **object** with provider fields; host-owned id/label/prefix/proxy_url/disabled/weight/priority move to SDK metadata/attributes. The host merges metadata over storage and forces `type`. `APIKey` and `AuthFields` preserve that precedence on execute/refresh/quota calls. Wrong provider type returns `Handled:false`. Malformed objects, duplicate top-level fields, missing keys, or wrongly typed routing fields return an error without a half-auth.
+Storage remains a JSON **object** with provider fields; host-owned id/label/prefix/proxy_url/disabled/weight/priority move to SDK metadata/attributes. The host merges metadata over storage and forces `type`. `APIKey` and `AuthFields` preserve that precedence on execute/refresh/quota calls. The `prefix` is normalized exactly like the host filestore: surrounding whitespace and `/` are trimmed, and a `prefix` still containing `/` is rejected with `invalid_auth` — the plugin path pins whatever `ParseAuth` returns verbatim, so a slashed prefix could otherwise merge two pinning namespaces while looking unpinned. Wrong provider type returns `Handled:false`. Malformed objects, duplicate top-level fields, missing keys, or wrongly typed routing fields return an error without a half-auth.
 
 ### Executor, errors and streaming
 
