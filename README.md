@@ -3,7 +3,7 @@
 Shared Go building blocks for first-class [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) provider plugins. This repository is a **library**, not an installable provider or a scheduler. The echo plugin is a loopback-only example for tests.
 
 - SDK: `github.com/router-for-me/CLIProxyAPI/v8 v8.0.48`
-- Native C ABI **1**, RPC schema **9**; Go **1.26.10+**, CGO and a C compiler
+- Native C ABI **1**, RPC schema **9** (registers with hosts at schema 9 or newer, for example CLIProxyAPI v8.0.49 at schema 10); Go **1.26.10+**, CGO and a C compiler
 - Native libraries built with `-buildmode=c-shared`, **not** Go's `plugin` package
 - Linux is the CI-tested target. Match the deployment architecture and libc; build provider release artifacts in `golang:1.26-bookworm` for a Debian-bookworm host. The exact host/plugin Go patch versions need not match across the C ABI.
 
@@ -124,7 +124,7 @@ err := cache.Store(pluginapi.QuotaFetchRequest{
 
 ### Lifecycle and ABI ownership
 
-`plugin.register` / `plugin.reconfigure` accept schema 9 and return registration metadata/capability flags. Configure gets the plugin config subtree as YAML bytes, not the whole host config. Reconfiguration first cancels and drains active work; a failed Configure leaves the runtime inactive until a successful configuration. `plugin.quiesce` stops admission and drains work. `plugin.shutdown` and the native shutdown function perform idempotent logical shutdown. Do not call lifecycle methods recursively from a capability/hook.
+`plugin.register` / `plugin.reconfigure` accept a host schema of 9 or newer (an older host is refused), answer with schema 9 so the host gates newer features, and return registration metadata/capability flags. Configure gets the plugin config subtree as YAML bytes, not the whole host config. Reconfiguration first cancels and drains active work; a failed Configure leaves the runtime inactive until a successful configuration. `plugin.quiesce` stops admission and drains work. `plugin.shutdown` and the native shutdown function perform idempotent logical shutdown. Do not call lifecycle methods recursively from a capability/hook.
 
 Capabilities must be concurrency-safe, immutable after construction, and cancelable. Quiesce waits for admitted work; a provider ignoring cancellation can prevent draining. Shutdown cancels streams, but does not unload a resident Go runtime. A native reinitialization uses the factory again.
 

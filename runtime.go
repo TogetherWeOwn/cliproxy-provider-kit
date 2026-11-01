@@ -192,8 +192,10 @@ func (r *Runtime) lifecycleCall(ctx context.Context, m string, raw []byte) (any,
 	if err := decode(raw, &req); err != nil {
 		return nil, err
 	}
-	if req.SchemaVersion != pluginabi.SchemaVersion {
-		return nil, rpcError("unsupported_schema", "this kit requires RPC schema 9", 400)
+	// A newer host still accepts a plugin that answers with an older schema
+	// (it gates newer features per plugin), so only an older host is refused.
+	if req.SchemaVersion < pluginabi.SchemaVersion {
+		return nil, rpcError("unsupported_schema", "this kit requires RPC schema 9 or newer", 400)
 	}
 	r.drain()
 	if r.def.Configure != nil {

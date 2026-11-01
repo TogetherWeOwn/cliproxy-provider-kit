@@ -111,9 +111,27 @@ func TestMetadataValidation(t *testing.T) {
 		})
 	}
 }
+
+// A newer host (schema 10, CLIProxyAPI v8.0.49) registers the plugin, which
+// answers with the kit's own schema so the host gates newer features.
+func TestNewerHostSchemaIsAccepted(t *testing.T) {
+	r := newRuntime(t, Definition{Metadata: metadata()}, nil)
+	var e pluginabi.Envelope
+	json.Unmarshal(r.Call(context.Background(), "plugin.register", []byte(`{"schema_version":10}`)), &e)
+	if !e.OK {
+		t.Fatalf("schema 10 host refused: %+v", e.Error)
+	}
+	var resp struct {
+		SchemaVersion uint32 `json:"schema_version"`
+	}
+	json.Unmarshal(e.Result, &resp)
+	if resp.SchemaVersion != pluginabi.SchemaVersion {
+		t.Fatalf("answered schema %d, want %d", resp.SchemaVersion, pluginabi.SchemaVersion)
+	}
+}
 func TestSchemaAndMalformedRequests(t *testing.T) {
 	r := newRuntime(t, Definition{Metadata: metadata()}, nil)
-	for _, raw := range []string{`{"schema_version":8}`, `{"schema_version":10}`, `null`, `[]`, `{"schema_version":9} trailing`} {
+	for _, raw := range []string{`{"schema_version":8}`, `null`, `[]`, `{"schema_version":9} trailing`} {
 		var e pluginabi.Envelope
 		json.Unmarshal(r.Call(context.Background(), "plugin.register", []byte(raw)), &e)
 		if e.OK {
