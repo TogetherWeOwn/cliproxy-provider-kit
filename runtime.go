@@ -34,12 +34,26 @@ func (f CallerFunc) Call(ctx context.Context, m string, b []byte) ([]byte, error
 // Hooks run serially after active calls/streams are canceled and drained.
 // Capabilities and metadata must not be mutated after New. Capability methods
 // must be concurrency-safe and honor context cancellation.
+//
+// ModelNamespace is the plugin's fixed vendor namespace (a bare segment such
+// as "synthetic"; the kit appends the slash). Any provider that serves models
+// made by another vendor must namespace its model ids so they never clash
+// when the official provider is added later. A definition that registers or
+// serves models (ModelRegistrar or ModelProvider set) must declare it; an
+// empty, missing or malformed namespace is a startup error. Every static,
+// discovered and dynamic model list is filtered through it: ids outside
+// "<namespace>/" (including doubled "<namespace>/<namespace>/…") are dropped
+// with a logged error and never served bare. The host auth-file `prefix` is
+// an outer host clone and does not replace this namespace.
 type Definition struct {
 	Metadata     pluginapi.Metadata
 	Capabilities pluginapi.Capabilities
-	Configure    func(context.Context, []byte) error
-	OnQuiesce    func(context.Context) error
-	OnShutdown   func(context.Context) error
+	// ModelNamespace declares the fixed vendor namespace for every model id
+	// this plugin registers or serves.
+	ModelNamespace string
+	Configure      func(context.Context, []byte) error
+	OnQuiesce      func(context.Context) error
+	OnShutdown     func(context.Context) error
 }
 
 // Runtime owns registration, dispatch and the lifetime of asynchronous work.
@@ -79,6 +93,15 @@ func New(d Definition, h Caller) (*Runtime, error) {
 		return nil, err
 	}
 	c := d.Capabilities
+	if c.ModelRegistrar != nil || c.ModelProvider != nil {
+		if err := ValidateModelNamespace(d.ModelNamespace); err != nil {
+			return nil, fmt.Errorf("model namespace: %w", err)
+		}
+	} else if d.ModelNamespace != "" {
+		if err := ValidateModelNamespace(d.ModelNamespace); err != nil {
+			return nil, fmt.Errorf("model namespace: %w", err)
+		}
+	}
 	if c.Executor != nil && (len(c.ExecutorInputFormats) == 0 || len(c.ExecutorOutputFormats) == 0) {
 		return nil, fmt.Errorf("executor requires input and output formats")
 	}
@@ -315,17 +338,41 @@ func (r *Runtime) dispatch(ctx context.Context, m string, raw []byte, finish fun
 		}
 	case pluginabi.MethodModelRegister:
 		if c.ModelRegistrar != nil {
-			result, err = invoke(ctx, raw, c.ModelRegistrar.RegisterModels)
+			result, err = invoke(ctx, raw, func(ctx context.Context, q pluginapi.ModelRegistrationRequest) (pluginapi.ModelRegistrationResponse, error) {
+				resp, err := c.ModelRegistrar.RegisterModels(ctx, q)
+				if err != nil {
+					return resp, err
+				}
+				resp.Models = filterModels(r.def.ModelNamespace, resp.Models)
+				resp.Registrations = filterRegistrations(r.def.ModelNamespace, resp.Registrations)
+				return resp, nil
+			})
 			return result, false, err
 		}
 	case pluginabi.MethodModelStatic:
 		if c.ModelProvider != nil {
-			result, err = invoke(ctx, raw, c.ModelProvider.StaticModels)
+			result, err = invoke(ctx, raw, func(ctx context.Context, q pluginapi.StaticModelRequest) (pluginapi.ModelResponse, error) {
+				resp, err := c.ModelProvider.StaticModels(ctx, q)
+				if err != nil {
+					return resp, err
+				}
+				resp.Models = filterModels(r.def.ModelNamespace, resp.Models)
+				resp.Registrations = filterRegistrations(r.def.ModelNamespace, resp.Registrations)
+				return resp, nil
+			})
 			return result, false, err
 		}
 	case pluginabi.MethodModelForAuth:
 		if c.ModelProvider != nil {
-			result, err = invokeHTTP(ctx, raw, r.host, func(q *pluginapi.AuthModelRequest, h pluginapi.HostHTTPClient) { q.HTTPClient = h }, c.ModelProvider.ModelsForAuth)
+			result, err = invokeHTTP(ctx, raw, r.host, func(q *pluginapi.AuthModelRequest, h pluginapi.HostHTTPClient) { q.HTTPClient = h }, func(ctx context.Context, q pluginapi.AuthModelRequest) (pluginapi.ModelResponse, error) {
+				resp, err := c.ModelProvider.ModelsForAuth(ctx, q)
+				if err != nil {
+					return resp, err
+				}
+				resp.Models = filterModels(r.def.ModelNamespace, resp.Models)
+				resp.Registrations = filterRegistrations(r.def.ModelNamespace, resp.Registrations)
+				return resp, nil
+			})
 			return result, false, err
 		}
 	case pluginabi.MethodExecutorIdentifier:

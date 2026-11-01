@@ -51,6 +51,40 @@ func init() {
 
 Use [`examples/echo/main.go`](examples/echo/main.go) for a complete executable example, including lifecycle configuration, static/per-auth models, auth headers, host HTTP execution and a cached quota provider. Its only permitted upstream is a literal loopback address supplied by the test harness. It has no production endpoint or real credentials.
 
+### Provider plugin standards
+
+Owner rule (2026-11-01): any provider that serves models made by another
+vendor **must namespace its model ids**, so they never clash with the official
+provider's ids when it is added later. This is enforced by the kit, not left
+as a convention:
+
+- Declare the fixed namespace once in the `Definition`, as a bare segment:
+  `ModelNamespace: "synthetic"`. A definition that registers or serves models
+  (`ModelRegistrar` or `ModelProvider` set) with an empty, missing or
+  malformed namespace fails in `New` — a startup error, never a silent
+  fallback.
+- The kit refuses to register any model whose id is not namespaced **exactly
+  once** (`<namespace>/…`). That covers static, discovered and dynamic lists
+  alike, including multi-provider `Registrations`: the offending model is
+  dropped with a logged error and never served bare. Bare ids, foreign
+  namespaces and doubled namespaces (`nvidia/nvidia/…`, usually a plugin
+  prefixing an already-prefixed upstream id) are dropped; a second layer past
+  the namespace (`cloudflare/@cf/…`) passes.
+- The executor keeps stripping exactly one leading `<namespace>/` before the
+  upstream request (plugin-side, as today). The host auth-file `prefix` is an
+  outer host clone and does **not** replace the fixed model namespace.
+- Prove it in the plugin's own test suite with the reusable conformance check,
+  called with every id the plugin can emit (static fallback, discovery
+  fixtures and dynamic refresh paths):
+
+```go
+providerkit.AssertModelNamespace(t, "synthetic", models)
+```
+
+`CheckModelNamespace` returns the same verdict as an error for harnesses
+without `testing.T`. `ValidateModelNamespace` checks a bare segment on its
+own.
+
 ### Public Go API
 
 | API | Provider responsibility / behavior |
@@ -59,9 +93,11 @@ Use [`examples/echo/main.go`](examples/echo/main.go) for a complete executable e
 | `New(Definition, Caller) (*Runtime, error)` | Supply validated SDK metadata, capabilities, and optional `Configure`, `OnQuiesce`, `OnShutdown` hooks. |
 | `Runtime.Call(ctx, method, raw) []byte` / `Shutdown(ctx)` | RPC envelopes and logical shutdown; normally used by the C shim, not provider code. |
 | `ValidateMetadata(pluginapi.Metadata) error` | Require nonempty Name/Version/Author/GitHubRepository and an HTTPS GitHub owner/repository URL. |
+| `ModelNamespace` (`Definition` field) + `ValidateModelNamespace(string) error` | Fixed vendor namespace for every registered/served model id; required when model capabilities are set, enforced on all three model paths. |
+| `CheckModelNamespace(ns, models) error` / `AssertModelNamespace(t, ns, models)` | Reusable conformance check for plugin test suites: every emitted id must carry `ns` exactly once. |
 | `APIKeyAuth` | Stateless SDK `AuthProvider`; top-level type dispatch, validation, stable IDs, API-key-only login errors, no-op refresh. Optional `Validate` checks provider fields. |
 | `AuthFields(storage, metadata)` / `APIKey(storage, metadata)` | Decode object storage with host-compatible metadata precedence; never include credential values in errors. |
-| `Passthrough` | SDK executor using **only** the injected `HostHTTPClient`. Supply `BuildRequest`; optionally `PrepareHTTP`, `ClassifyError`, and `TokenCount`. |
+| `Passthrough` | SDK executor using **only** the injected `HostHTTPClient`. Supply `BuildRequest`; optionally `PrepareHTTP`, `ClassifyError`, and `TokenCount`. `ExecuteStream` re-frames SSE upstreams (`text/event-stream`, or a missing Content-Type) for OpenAI-protocol plugin output into one host chunk per data event (comments/`[DONE]` dropped) and forwards anything else unchanged — other Content-Types so the host frames them, non-OpenAI output so translators and native host paths keep complete framed SSE; callers must not frame again. |
 | `MapError(error) *pluginabi.Error` | Preserve explicit code/status/retry fields; redact unclassified errors. |
 | `RetryAfterSeconds(header, now) int` | Parse HTTP seconds/date retry guidance without a hidden clock. |
 | `NewCachedQuota(provider, display, FetchQuotaFunc) *CachedQuota` | Non-resettable SDK `QuotaProvider`; successful per-auth cache for `QuotaCacheTTL` = 60 seconds, coalesced concurrent fetches, copy isolation. |
@@ -90,6 +126,8 @@ Storage remains a JSON **object** with provider fields; host-owned id/label/pref
 `BuildRequest` must choose a trusted endpoint and add the provider's auth headers. Preserve the final `ExecutorRequest.Payload`; CLIProxy has already applied its payload policy. `PrepareHTTP` can inject auth and restrict the URL for SDK `HttpRequest`; without it that method forwards the supplied HTTP request unchanged. Do not copy client credentials blindly into upstream headers. The kit never constructs an independent executor transport.
 
 `ExecuteStream` opens HTTP through `host.http.do_stream`, reads raw chunks incrementally, and returns headers before completion. Runtime forwards chunks asynchronously with `host.stream.emit` and exactly one `host.stream.close`. It does not buffer the entire stream. Upstream setup failures return a normal RPC error; late stream failures carry structured `error_detail`. Host operation IDs propagate cancellation to blocked HTTP setup/read calls. Providers must honor contexts, and consumers must drain a stream or cancel its context.
+
+`ExecuteStream` normalizes the upstream stream according to its Content-Type and the plugin's declared output format before returning. SSE upstreams (`text/event-stream`, or a missing Content-Type, which keeps the SSE assumption behind the host's chunk contract) from an OpenAI-protocol plugin are re-framed into exactly one host chunk per data event: events split on blank lines, `:` comments and `[DONE]` dropped, one chunk per event — the bare JSON payload for OpenAI chat/completions clients (the host records the inbound route in the request metadata's `request_path`; without it the chunk stays `data:`-framed, the host's documented chunk form). Any other Content-Type (bare JSON, NDJSON) is forwarded unchanged so the host frames it, as is SSE from a non-OpenAI plugin output so translators and native host paths keep complete framed SSE with event names. Pass-through plugins must not frame again: raw upstream reads wrapped in a second `data:` prefix produced `data: data:` frames and duplicate `[DONE]` on `/v1/chat/completions` and lost tokens on `/v1/messages`. A truncated frame cut short by an upstream error is dropped while the error still propagates; an event over 8 MiB, or a multi-line event that is not one JSON value, ends the stream with an `invalid_stream` error, and releases the upstream feed.
 
 Classify provider errors explicitly, including exhaustion versus transient throttling, using **safe public text**:
 

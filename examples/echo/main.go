@@ -3,9 +3,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync/atomic"
 
 	providerkit "github.com/TogetherWeOwn/cliproxy-provider-kit"
@@ -47,7 +49,11 @@ func makePlugin(host providerkit.Caller) (*providerkit.Runtime, error) {
 		if err != nil {
 			return pluginapi.HTTPRequest{}, err
 		}
-		return pluginapi.HTTPRequest{Method: http.MethodPost, URL: upstream.Load().(string), Headers: http.Header{"Authorization": {"Bearer " + key}, "Content-Type": {"application/json"}}, Body: r.Payload}, nil
+		// The kit serves the namespaced id (echo/echo-model); the upstream
+		// speaks the bare model, so strip exactly one leading namespace
+		// segment before sending, mirroring what real plugins do.
+		body := stripEchoNamespace(r.Payload)
+		return pluginapi.HTTPRequest{Method: http.MethodPost, URL: upstream.Load().(string), Headers: http.Header{"Authorization": {"Bearer " + key}, "Content-Type": {"application/json"}}, Body: body}, nil
 	}, PrepareHTTP: func(_ context.Context, r pluginapi.ExecutorHTTPRequest) (pluginapi.HTTPRequest, error) {
 		key, err := providerkit.APIKey(r.StorageJSON, r.Metadata)
 		if err != nil {
@@ -64,15 +70,47 @@ func makePlugin(host providerkit.Caller) (*providerkit.Runtime, error) {
 	quota := providerkit.NewCachedQuota("echo", "Echo fixture", func(context.Context, pluginapi.QuotaFetchRequest) (pluginapi.QuotaFetchResponse, error) {
 		return pluginapi.QuotaFetchResponse{Groups: []pluginapi.QuotaGroup{{DisplayName: "Example credits", Buckets: []pluginapi.QuotaBucket{{Window: "weekly", RemainingFraction: 1, Description: "Fixture data, not a real subscription"}}}}}, nil
 	})
-	return providerkit.New(providerkit.Definition{Metadata: pluginapi.Metadata{Name: "echo", Version: "0.1.0", Author: "TogetherWeOwn", GitHubRepository: "https://github.com/TogetherWeOwn/cliproxy-provider-kit"}, Configure: configure, Capabilities: pluginapi.Capabilities{
+	return providerkit.New(providerkit.Definition{Metadata: pluginapi.Metadata{Name: "echo", Version: "0.1.0", Author: "TogetherWeOwn", GitHubRepository: "https://github.com/TogetherWeOwn/cliproxy-provider-kit"}, ModelNamespace: "echo", Configure: configure, Capabilities: pluginapi.Capabilities{
 		AuthProvider: providerkit.APIKeyAuth{Provider: "echo"}, ModelRegistrar: catalog{}, ModelProvider: catalog{}, Executor: executor, ExecutorModelScope: pluginapi.ExecutorModelScopeBoth, ExecutorInputFormats: []string{"openai"}, ExecutorOutputFormats: []string{"openai"}, QuotaProvider: quota,
 	}}, host)
+}
+
+// stripEchoNamespace removes exactly one leading "echo/" from the payload's
+// model field, if present. Bare ids pass through unchanged. Only the model
+// member is decoded: every other field keeps its raw JSON so large integers
+// elsewhere in the payload are never rounded through float64.
+func stripEchoNamespace(payload []byte) []byte {
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &body); err != nil {
+		return payload
+	}
+	rawModel, ok := body["model"]
+	if !ok {
+		return payload
+	}
+	var model string
+	if err := json.Unmarshal(rawModel, &model); err != nil {
+		return payload
+	}
+	rest, ok := strings.CutPrefix(model, "echo/")
+	if !ok || rest == "" {
+		return payload
+	}
+	raw, err := json.Marshal(rest)
+	if err != nil {
+		return payload
+	}
+	body["model"] = raw
+	if out, err := json.Marshal(body); err == nil {
+		return out
+	}
+	return payload
 }
 
 type catalog struct{}
 
 func echoModels() []pluginapi.ModelInfo {
-	return []pluginapi.ModelInfo{{ID: "echo-model", Object: "model", OwnedBy: "echo", DisplayName: "Echo fixture", ContextLength: 8192, MaxCompletionTokens: 1024}}
+	return []pluginapi.ModelInfo{{ID: "echo/echo-model", Object: "model", OwnedBy: "echo", DisplayName: "Echo fixture", ContextLength: 8192, MaxCompletionTokens: 1024}}
 }
 func (catalog) RegisterModels(context.Context, pluginapi.ModelRegistrationRequest) (pluginapi.ModelRegistrationResponse, error) {
 	return pluginapi.ModelRegistrationResponse{Provider: "echo", Models: echoModels()}, nil
