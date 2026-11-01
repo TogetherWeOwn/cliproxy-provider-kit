@@ -475,3 +475,33 @@ func TestQuotaTransportSpeaksHTTP1ToHTTP2Servers(t *testing.T) {
 		}
 	}
 }
+
+// TestQuotaWindowLabel pins the canonical panel labels: short window-style
+// text the panel shows as the row label.
+func TestQuotaWindowLabel(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"5h", "5-hour limit"},
+		{"five-hour", "5-hour limit"},
+		{"weekly", "Weekly limit"},
+		{"week", "Weekly limit"},
+		{"monthly", "Monthly limit"},
+		{"daily", "Daily limit"},
+		{"per-minute", "per-minute"},
+	} {
+		if got := QuotaWindowLabel(tc.in); got != tc.want {
+			t.Errorf("QuotaWindowLabel(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestNewQuotaBucket proves card rows carry the canonical label and never a
+// Description: the panel would show a Description as the row label.
+func TestNewQuotaBucket(t *testing.T) {
+	b := NewQuotaBucket("weekly", 0.5, "2026-11-02T00:00:00Z")
+	if b.Window != "Weekly limit" || b.RemainingFraction != 0.5 || b.ResetTime != "2026-11-02T00:00:00Z" {
+		t.Fatalf("wrong bucket: %+v", b)
+	}
+	if b.Description != "" {
+		t.Fatalf("bucket must not set Description: %+v", b)
+	}
+}
