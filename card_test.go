@@ -1,6 +1,7 @@
 package providerkit
 
 import (
+	"math"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -16,6 +17,14 @@ func TestUSD(t *testing.T) {
 		{0, "$0.00"},
 		{-0.02, "-$0.02"},
 		{9.996, "$10.00"},
+		{math.Copysign(0, -1), "$0.00"},
+		{-0.001, "-$0.00"},
+		// 2.675 is not exact in float64 (it is 2.67499999...), so this
+		// documents float formatting, not decimal rounding.
+		{2.675, "$2.67"},
+		{math.NaN(), "$0.00"},
+		{math.Inf(1), "$0.00"},
+		{math.Inf(-1), "$0.00"},
 	} {
 		if got := USD(tc.in); got != tc.want {
 			t.Errorf("USD(%v) = %q, want %q", tc.in, got, tc.want)
@@ -55,5 +64,41 @@ func TestCheckCardRejectsExtras(t *testing.T) {
 	violations := CheckCard(resp)
 	if len(violations) != 3 {
 		t.Fatalf("want 3 violations (description, chip count, repeat), got %v", violations)
+	}
+}
+
+func TestCheckCardBoundaries(t *testing.T) {
+	bar := func(window string) pluginapi.QuotaBucket {
+		return pluginapi.QuotaBucket{Window: window, RemainingFraction: 0.5}
+	}
+	// Exactly MaxCardSummaryChips chips are accepted; one more is not.
+	full := pluginapi.QuotaFetchResponse{
+		Summary: []pluginapi.QuotaMetric{{Key: "a", Label: "Balance"}, {Key: "b", Label: "Lifetime spent"}, {Key: "c", Label: "Key expires in"}},
+		Groups:  []pluginapi.QuotaGroup{{DisplayName: "OpenRouter", Buckets: []pluginapi.QuotaBucket{bar("Weekly key limit")}}},
+	}
+	if violations := CheckCard(full); len(violations) != 0 {
+		t.Fatalf("exactly 3 chips must pass: %v", violations)
+	}
+	over := full
+	over.Summary = append(over.Summary, pluginapi.QuotaMetric{Key: "d", Label: "One too many"})
+	if violations := CheckCard(over); len(violations) != 1 {
+		t.Fatalf("4 chips must fail: %v", violations)
+	}
+	// A chip repeating a bar fails however the text overlaps.
+	for _, label := range []string{"Weekly key limit", "weekly key", "Weekly key limit remaining"} {
+		resp := pluginapi.QuotaFetchResponse{
+			Summary: []pluginapi.QuotaMetric{{Key: "x", Label: label}},
+			Groups:  []pluginapi.QuotaGroup{{Buckets: []pluginapi.QuotaBucket{bar("Weekly key limit")}}},
+		}
+		if violations := CheckCard(resp); len(violations) != 1 {
+			t.Fatalf("label %q must repeat the bar: %v", label, violations)
+		}
+	}
+	// Whitespace-only descriptions still hide the Window row label.
+	blank := pluginapi.QuotaFetchResponse{
+		Groups: []pluginapi.QuotaGroup{{Buckets: []pluginapi.QuotaBucket{{Window: "Weekly limit", Description: "  "}}}},
+	}
+	if violations := CheckCard(blank); len(violations) != 1 {
+		t.Fatalf("whitespace description must fail: %v", violations)
 	}
 }

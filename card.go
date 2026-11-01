@@ -12,6 +12,7 @@ package providerkit
 
 import (
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -36,8 +37,13 @@ const MaxCardSummaryChips = 3
 // USD formats dollars with exactly 2 decimals, sign first:
 // 25 -> $25.00, -0.02 -> -$0.02. Amounts in bucket text must use this, never
 // a higher-precision debug format; chip currency metrics are formatted
-// panel-side from the numeric value.
+// panel-side from the numeric value. Non-finite inputs render as $0.00:
+// JSON-decoded amounts are always finite, so this branch is unreachable
+// defense so a card can never show $NaN.
 func USD(v float64) string {
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return "$0.00"
+	}
 	if v == 0 {
 		return "$0.00"
 	}
@@ -59,7 +65,10 @@ func CheckCard(resp pluginapi.QuotaFetchResponse) []string {
 	var violations []string
 	for gi, g := range resp.Groups {
 		for _, b := range g.Buckets {
-			if strings.TrimSpace(b.Description) != "" {
+			// Any non-empty Description is a violation, even whitespace-only:
+			// the panel renders it as the row label, so a blank-looking
+			// description would still hide the Window label.
+			if b.Description != "" {
 				violations = append(violations, fmt.Sprintf("groups[%d] bucket (%q) sets Description; leave it empty so Window stays the row label", gi, b.Window))
 			}
 		}
