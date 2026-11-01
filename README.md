@@ -51,6 +51,40 @@ func init() {
 
 Use [`examples/echo/main.go`](examples/echo/main.go) for a complete executable example, including lifecycle configuration, static/per-auth models, auth headers, host HTTP execution and a cached quota provider. Its only permitted upstream is a literal loopback address supplied by the test harness. It has no production endpoint or real credentials.
 
+### Provider plugin standards
+
+Owner rule (2026-11-01): any provider that serves models made by another
+vendor **must namespace its model ids**, so they never clash with the official
+provider's ids when it is added later. This is enforced by the kit, not left
+as a convention:
+
+- Declare the fixed namespace once in the `Definition`, as a bare segment:
+  `ModelNamespace: "synthetic"`. A definition that registers or serves models
+  (`ModelRegistrar` or `ModelProvider` set) with an empty, missing or
+  malformed namespace fails in `New` — a startup error, never a silent
+  fallback.
+- The kit refuses to register any model whose id is not namespaced **exactly
+  once** (`<namespace>/…`). That covers static, discovered and dynamic lists
+  alike, including multi-provider `Registrations`: the offending model is
+  dropped with a logged error and never served bare. Bare ids, foreign
+  namespaces and doubled namespaces (`nvidia/nvidia/…`, usually a plugin
+  prefixing an already-prefixed upstream id) are dropped; a second layer past
+  the namespace (`cloudflare/@cf/…`) passes.
+- The executor keeps stripping exactly one leading `<namespace>/` before the
+  upstream request (plugin-side, as today). The host auth-file `prefix` is an
+  outer host clone and does **not** replace the fixed model namespace.
+- Prove it in the plugin's own test suite with the reusable conformance check,
+  called with every id the plugin can emit (static fallback, discovery
+  fixtures and dynamic refresh paths):
+
+```go
+providerkit.AssertModelNamespace(t, "synthetic", models)
+```
+
+`CheckModelNamespace` returns the same verdict as an error for harnesses
+without `testing.T`. `ValidateModelNamespace` checks a bare segment on its
+own.
+
 ### Public Go API
 
 | API | Provider responsibility / behavior |
@@ -59,6 +93,8 @@ Use [`examples/echo/main.go`](examples/echo/main.go) for a complete executable e
 | `New(Definition, Caller) (*Runtime, error)` | Supply validated SDK metadata, capabilities, and optional `Configure`, `OnQuiesce`, `OnShutdown` hooks. |
 | `Runtime.Call(ctx, method, raw) []byte` / `Shutdown(ctx)` | RPC envelopes and logical shutdown; normally used by the C shim, not provider code. |
 | `ValidateMetadata(pluginapi.Metadata) error` | Require nonempty Name/Version/Author/GitHubRepository and an HTTPS GitHub owner/repository URL. |
+| `ModelNamespace` (`Definition` field) + `ValidateModelNamespace(string) error` | Fixed vendor namespace for every registered/served model id; required when model capabilities are set, enforced on all three model paths. |
+| `CheckModelNamespace(ns, models) error` / `AssertModelNamespace(t, ns, models)` | Reusable conformance check for plugin test suites: every emitted id must carry `ns` exactly once. |
 | `APIKeyAuth` | Stateless SDK `AuthProvider`; top-level type dispatch, validation, stable IDs, API-key-only login errors, no-op refresh. Optional `Validate` checks provider fields. |
 | `AuthFields(storage, metadata)` / `APIKey(storage, metadata)` | Decode object storage with host-compatible metadata precedence; never include credential values in errors. |
 | `Passthrough` | SDK executor using **only** the injected `HostHTTPClient`. Supply `BuildRequest`; optionally `PrepareHTTP`, `ClassifyError`, and `TokenCount`. |

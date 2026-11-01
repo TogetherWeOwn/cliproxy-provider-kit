@@ -14,16 +14,16 @@ import (
 type testCatalog struct{}
 
 func (testCatalog) RegisterModels(context.Context, pluginapi.ModelRegistrationRequest) (pluginapi.ModelRegistrationResponse, error) {
-	return pluginapi.ModelRegistrationResponse{Registrations: []pluginapi.ProviderModels{{Provider: "echo", Models: []pluginapi.ModelInfo{{ID: "echo-model"}}}}}, nil
+	return pluginapi.ModelRegistrationResponse{Registrations: []pluginapi.ProviderModels{{Provider: "echo", Models: []pluginapi.ModelInfo{{ID: "echo/echo-model"}}}}}, nil
 }
 func (testCatalog) StaticModels(context.Context, pluginapi.StaticModelRequest) (pluginapi.ModelResponse, error) {
-	return pluginapi.ModelResponse{Provider: "echo", Models: []pluginapi.ModelInfo{{ID: "echo-model"}}}, nil
+	return pluginapi.ModelResponse{Provider: "echo", Models: []pluginapi.ModelInfo{{ID: "echo/echo-model"}}}, nil
 }
 func (testCatalog) ModelsForAuth(_ context.Context, r pluginapi.AuthModelRequest) (pluginapi.ModelResponse, error) {
 	if r.HTTPClient == nil {
 		return pluginapi.ModelResponse{}, errors.New("no scoped client")
 	}
-	return pluginapi.ModelResponse{Provider: r.AuthProvider, Models: []pluginapi.ModelInfo{{ID: "auth-model"}}}, nil
+	return pluginapi.ModelResponse{Provider: r.AuthProvider, Models: []pluginapi.ModelInfo{{ID: "echo/auth-model"}}}, nil
 }
 
 type usageCounter struct{ n atomic.Int32 }
@@ -34,7 +34,7 @@ func TestRuntimeCapabilityDispatch(t *testing.T) {
 	q := NewCachedQuota("echo", "Echo", func(context.Context, pluginapi.QuotaFetchRequest) (pluginapi.QuotaFetchResponse, error) {
 		return quotaFixture(.75), nil
 	})
-	r := newRuntime(t, Definition{Metadata: metadata(), Capabilities: pluginapi.Capabilities{AuthProvider: APIKeyAuth{Provider: "echo"}, ModelProvider: testCatalog{}, ModelRegistrar: testCatalog{}, Executor: &testExecutor{}, ExecutorInputFormats: []string{"openai"}, ExecutorOutputFormats: []string{"openai"}, QuotaProvider: q, UsagePlugin: usage}}, nil)
+	r := newRuntime(t, Definition{Metadata: metadata(), ModelNamespace: "echo", Capabilities: pluginapi.Capabilities{AuthProvider: APIKeyAuth{Provider: "echo"}, ModelProvider: testCatalog{}, ModelRegistrar: testCatalog{}, Executor: &testExecutor{}, ExecutorInputFormats: []string{"openai"}, ExecutorOutputFormats: []string{"openai"}, QuotaProvider: q, UsagePlugin: usage}}, nil)
 	register(t, r)
 	for _, tc := range []struct {
 		method string

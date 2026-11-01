@@ -64,7 +64,7 @@ func makePlugin(host providerkit.Caller) (*providerkit.Runtime, error) {
 	quota := providerkit.NewCachedQuota("echo", "Echo fixture", func(context.Context, pluginapi.QuotaFetchRequest) (pluginapi.QuotaFetchResponse, error) {
 		return pluginapi.QuotaFetchResponse{Groups: []pluginapi.QuotaGroup{{DisplayName: "Example credits", Buckets: []pluginapi.QuotaBucket{{Window: "weekly", RemainingFraction: 1, Description: "Fixture data, not a real subscription"}}}}}, nil
 	})
-	return providerkit.New(providerkit.Definition{Metadata: pluginapi.Metadata{Name: "echo", Version: "0.1.0", Author: "TogetherWeOwn", GitHubRepository: "https://github.com/TogetherWeOwn/cliproxy-provider-kit"}, Configure: configure, Capabilities: pluginapi.Capabilities{
+	return providerkit.New(providerkit.Definition{Metadata: pluginapi.Metadata{Name: "echo", Version: "0.1.0", Author: "TogetherWeOwn", GitHubRepository: "https://github.com/TogetherWeOwn/cliproxy-provider-kit"}, ModelNamespace: "echo", Configure: configure, Capabilities: pluginapi.Capabilities{
 		AuthProvider: providerkit.APIKeyAuth{Provider: "echo"}, ModelRegistrar: catalog{}, ModelProvider: catalog{}, Executor: executor, ExecutorModelScope: pluginapi.ExecutorModelScopeBoth, ExecutorInputFormats: []string{"openai"}, ExecutorOutputFormats: []string{"openai"}, QuotaProvider: quota,
 	}}, host)
 }
@@ -72,7 +72,7 @@ func makePlugin(host providerkit.Caller) (*providerkit.Runtime, error) {
 type catalog struct{}
 
 func echoModels() []pluginapi.ModelInfo {
-	return []pluginapi.ModelInfo{{ID: "echo-model", Object: "model", OwnedBy: "echo", DisplayName: "Echo fixture", ContextLength: 8192, MaxCompletionTokens: 1024}}
+	return []pluginapi.ModelInfo{{ID: "echo/echo-model", Object: "model", OwnedBy: "echo", DisplayName: "Echo fixture", ContextLength: 8192, MaxCompletionTokens: 1024}}
 }
 func (catalog) RegisterModels(context.Context, pluginapi.ModelRegistrationRequest) (pluginapi.ModelRegistrationResponse, error) {
 	return pluginapi.ModelRegistrationResponse{Provider: "echo", Models: echoModels()}, nil
