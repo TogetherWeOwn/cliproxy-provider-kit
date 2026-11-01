@@ -109,6 +109,10 @@ func frameStreamChunks(ctx context.Context, in <-chan pluginapi.ExecutorStreamCh
 		}
 		// run consumes the input; it returns nil at the end of the stream.
 		run := func() error {
+			// skipLF remembers a CR that ended a line at the end of the
+			// previous read: one LF opening the next read is the same
+			// line ending, anything else starts a new line.
+			var skipLF bool
 			for {
 				select {
 				case <-ctx.Done():
@@ -123,6 +127,12 @@ func frameStreamChunks(ctx context.Context, in <-chan pluginapi.ExecutorStreamCh
 						return dispatch()
 					}
 					buf := append(line, c.Payload...)
+					if skipLF {
+						skipLF = false
+						if len(buf) > 0 && buf[0] == '\n' {
+							buf = buf[1:]
+						}
+					}
 					for len(buf) > 0 {
 						i := bytes.IndexAny(buf, "\r\n")
 						if i < 0 {
@@ -130,14 +140,16 @@ func frameStreamChunks(ctx context.Context, in <-chan pluginapi.ExecutorStreamCh
 						}
 						next := i + 1
 						if buf[i] == '\r' {
-							if i+1 >= len(buf) {
-								// A trailing CR may be a CRLF split
-								// across reads; hold it for more
-								// input or EOF.
-								break
-							}
-							if buf[i+1] == '\n' {
-								next = i + 2
+							// CR ends the line at once so a
+							// CR-delimited event flushes without
+							// waiting for another read; a
+							// following LF is the same ending.
+							if i+1 < len(buf) {
+								if buf[i+1] == '\n' {
+									next = i + 2
+								}
+							} else {
+								skipLF = true
 							}
 						}
 						if err := field(buf[:i]); err != nil {

@@ -154,6 +154,29 @@ func TestFrameStreamChunksCRLineEndings(t *testing.T) {
 	}
 }
 
+// A CR-delimited event flushed with the feed still open must be delivered
+// without waiting for another read or EOF: a trailing CR ends the line at
+// once, and only a following LF is swallowed.
+func TestFrameStreamChunksCRDelimitedFlushesWithoutMoreInput(t *testing.T) {
+	in := make(chan pluginapi.ExecutorStreamChunk, 1)
+	in <- streamBytes("data: {\"a\":1}\r\r")
+	out := frameStreamChunks(context.Background(), in, false, nil)
+	select {
+	case c := <-out:
+		if c.Err != nil {
+			t.Fatalf("err %v", c.Err)
+		}
+		if got := string(c.Payload); got != `data: {"a":1}` {
+			t.Fatalf("got %q", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("CR-delimited event stalled with the feed still open")
+	}
+	close(in)
+	for range out {
+	}
+}
+
 func TestFrameStreamChunksBoundsEmptyLines(t *testing.T) {
 	// Every data line advances the event bound, even empty ones: an event
 	// of blank data lines with no terminator must still trip it.
