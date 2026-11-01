@@ -3,6 +3,7 @@ package providerkit
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"io"
 	"net/http"
 	"time"
@@ -33,6 +34,15 @@ func NewQuotaTransport() *http.Transport {
 	t.Proxy = QuotaProxy
 	t.Protocols = new(http.Protocols)
 	t.Protocols.SetHTTP1(true)
+	// The cloned default transport still forces an HTTP/2 attempt, so TLS
+	// negotiated h2 with servers that offer it (api.cloudflare.com does) and the
+	// HTTP/1.1 client then read an HTTP/2 SETTINGS frame as a malformed
+	// response. Offer only http/1.1 in ALPN.
+	t.ForceAttemptHTTP2 = false
+	if t.TLSClientConfig == nil {
+		t.TLSClientConfig = &tls.Config{}
+	}
+	t.TLSClientConfig.NextProtos = []string{"http/1.1"}
 	return t
 }
 

@@ -3,6 +3,7 @@ package providerkit
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -447,5 +448,30 @@ func TestQuotaHTTPMethodAndStatusClassification(t *testing.T) {
 	}
 	if _, err := c.Do(context.Background(), pluginapi.HTTPRequest{URL: "://example-key"}); err == nil || strings.Contains(err.Error(), "example-key") {
 		t.Fatalf("invalid URL %v", err)
+	}
+}
+
+// A server that offers HTTP/2 over TLS (as api.cloudflare.com does) must still
+// be read over HTTP/1.1, not misread as a malformed response.
+func TestQuotaTransportSpeaksHTTP1ToHTTP2Servers(t *testing.T) {
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(r.Proto))
+	}))
+	server.EnableHTTP2 = true
+	server.StartTLS()
+	defer server.Close()
+	transport := NewQuotaTransport()
+	transport.TLSClientConfig.RootCAs = server.Client().Transport.(*http.Transport).TLSClientConfig.RootCAs
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		req, _ := http.NewRequest(method, server.URL, nil)
+		resp, err := (&http.Client{Transport: transport}).Do(req)
+		if err != nil {
+			t.Fatalf("%s: %v", method, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.ProtoMajor != 1 || string(body) != "HTTP/1.1" {
+			t.Fatalf("%s: proto %s, server saw %s", method, resp.Proto, body)
+		}
 	}
 }
