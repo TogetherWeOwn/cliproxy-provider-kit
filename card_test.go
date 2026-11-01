@@ -18,7 +18,8 @@ func TestUSD(t *testing.T) {
 		{-0.02, "-$0.02"},
 		{9.996, "$10.00"},
 		{math.Copysign(0, -1), "$0.00"},
-		{-0.001, "-$0.00"},
+		{-0.001, "$0.00"},
+		{-0.004, "$0.00"},
 		// 2.675 is not exact in float64 (it is 2.67499999...), so this
 		// documents float formatting, not decimal rounding.
 		{2.675, "$2.67"},
@@ -94,11 +95,22 @@ func TestCheckCardBoundaries(t *testing.T) {
 			t.Fatalf("label %q must repeat the bar: %v", label, violations)
 		}
 	}
-	// Whitespace-only descriptions still hide the Window row label.
+	// Whitespace-only descriptions fail for consistency, even though the
+	// panel trims them and falls back to Window.
 	blank := pluginapi.QuotaFetchResponse{
 		Groups: []pluginapi.QuotaGroup{{Buckets: []pluginapi.QuotaBucket{{Window: "Weekly limit", Description: "  "}}}},
 	}
 	if violations := CheckCard(blank); len(violations) != 1 {
 		t.Fatalf("whitespace description must fail: %v", violations)
+	}
+	// A bucket with a blank Window has no row label and must fail, even
+	// with an empty Description.
+	for _, window := range []string{"", "   "} {
+		resp := pluginapi.QuotaFetchResponse{
+			Groups: []pluginapi.QuotaGroup{{Buckets: []pluginapi.QuotaBucket{{Window: window}}}},
+		}
+		if violations := CheckCard(resp); len(violations) != 1 {
+			t.Fatalf("blank Window %q must fail: %v", window, violations)
+		}
 	}
 }

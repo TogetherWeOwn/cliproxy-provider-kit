@@ -68,7 +68,7 @@ func makePlugin(host providerkit.Caller) (*providerkit.Runtime, error) {
 		return pluginapi.HTTPRequest{Method: r.Method, URL: upstream.Load().(string), Headers: headers, Body: r.Body}, nil
 	}}
 	quota := providerkit.NewCachedQuota("echo", "Echo fixture", func(context.Context, pluginapi.QuotaFetchRequest) (pluginapi.QuotaFetchResponse, error) {
-		return pluginapi.QuotaFetchResponse{Groups: []pluginapi.QuotaGroup{{DisplayName: "Example credits", Buckets: []pluginapi.QuotaBucket{{Window: "weekly", RemainingFraction: 1, Description: "Fixture data, not a real subscription"}}}}}, nil
+		return pluginapi.QuotaFetchResponse{Groups: []pluginapi.QuotaGroup{{DisplayName: "Example credits", Buckets: []pluginapi.QuotaBucket{{Window: providerkit.CardWindowWeekly, RemainingFraction: 1}}}}}, nil
 	})
 	return providerkit.New(providerkit.Definition{Metadata: pluginapi.Metadata{Name: "echo", Version: "0.1.0", Author: "TogetherWeOwn", GitHubRepository: "https://github.com/TogetherWeOwn/cliproxy-provider-kit"}, ModelNamespace: "echo", Configure: configure, Capabilities: pluginapi.Capabilities{
 		AuthProvider: providerkit.APIKeyAuth{Provider: "echo"}, ModelRegistrar: catalog{}, ModelProvider: catalog{}, Executor: executor, ExecutorModelScope: pluginapi.ExecutorModelScopeBoth, ExecutorInputFormats: []string{"openai"}, ExecutorOutputFormats: []string{"openai"}, QuotaProvider: quota,

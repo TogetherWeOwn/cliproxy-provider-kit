@@ -19,9 +19,8 @@ import (
 )
 
 // Canonical short row labels for quota windows, matching the official
-// provider cards. Keep Window values short: the panel sorts plugin buckets by
-// window for the well-known values and falls back to label order, so staging
-// screenshots must confirm multi-window order after relabelling.
+// provider cards. Keep Window values short; staging screenshots must
+// confirm multi-window order after relabelling.
 const (
 	CardWindowFiveHour = "5-hour limit"
 	CardWindowWeekly   = "Weekly limit"
@@ -44,18 +43,20 @@ func USD(v float64) string {
 	if math.IsNaN(v) || math.IsInf(v, 0) {
 		return "$0.00"
 	}
-	if v == 0 {
+	neg := math.Signbit(v)
+	s := fmt.Sprintf("$%.2f", math.Abs(v))
+	if s == "$0.00" {
 		return "$0.00"
 	}
-	sign := ""
-	if v < 0 {
-		sign, v = "-", -v
+	if neg {
+		return "-" + s
 	}
-	return sign + fmt.Sprintf("$%.2f", v)
+	return s
 }
 
 // CheckCard reports official-card-style violations in a quota response:
-//   - any bucket Description (the panel renders it as the row label);
+//   - any bucket Description (leave it empty so Window stays the row label);
+//   - any bucket with a blank Window (the row would have no label);
 //   - more than MaxCardSummaryChips summary metrics;
 //   - a summary metric repeating a bar (same or overlapping label text).
 //
@@ -64,10 +65,13 @@ func USD(v float64) string {
 func CheckCard(resp pluginapi.QuotaFetchResponse) []string {
 	var violations []string
 	for gi, g := range resp.Groups {
-		for _, b := range g.Buckets {
+		for bi, b := range g.Buckets {
+			if strings.TrimSpace(b.Window) == "" {
+				violations = append(violations, fmt.Sprintf("groups[%d] buckets[%d] has a blank Window; set a short row label so the row has a name", gi, bi))
+			}
 			// Any non-empty Description is a violation, even whitespace-only:
-			// the panel renders it as the row label, so a blank-looking
-			// description would still hide the Window label.
+			// the panel trims Description and falls back to Window when blank,
+			// so this is a consistency rule to keep cards uniform, not a render fix.
 			if b.Description != "" {
 				violations = append(violations, fmt.Sprintf("groups[%d] bucket (%q) sets Description; leave it empty so Window stays the row label", gi, b.Window))
 			}
