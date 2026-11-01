@@ -39,6 +39,13 @@ type quotaEntry struct {
 	expires time.Time
 	raw     []byte
 	err     error
+	// cred binds a header observation to the credential generation that
+	// produced it. Entries stored without credential context (hasCred false)
+	// are served to any credential of the same auth identity, preserving the
+	// UsageRecord fast path; a credential-keyed fetch never serves an
+	// observation bound to a different credential (G-K3).
+	cred    [32]byte
+	hasCred bool
 }
 
 // NewCachedQuota creates an empty quota cache. The identity and callback are
@@ -107,10 +114,17 @@ func (q *CachedQuota) FetchQuota(ctx context.Context, r pluginapi.QuotaFetchRequ
 		}
 	}
 	// Usage records carry auth identity but no credential context. Prefer their
-	// fresh header observations even when the host enriches the fetch request.
+	// fresh header observations even when the host enriches the fetch request,
+	// unless the observation is bound to a different credential generation
+	// (for example a rotated key under a reused auth identity).
 	if e := q.observations[key.AuthID]; e != nil {
-		q.mu.Unlock()
-		return decodeQuota(e)
+		// A credential-bound observation never serves a different credential
+		// generation. Fall through holding the lock and poll fresh instead;
+		// the TTL evicts the orphaned generation.
+		if !e.hasCred || e.cred == key.Credentials {
+			q.mu.Unlock()
+			return decodeQuota(e)
+		}
 	}
 	if e := q.entries[key]; e != nil {
 		q.mu.Unlock()
@@ -157,10 +171,16 @@ func (q *CachedQuota) FetchQuota(ctx context.Context, r pluginapi.QuotaFetchRequ
 
 // Store replaces an auth-identity observation (for example, from a provider
 // quota header). Only AuthID (or AuthIndex when AuthID is absent) and an optional
-// matching Provider are used; credential context is neither needed nor keyed.
-// Fresh observations take precedence over polls, including older in-flight
-// polls. Data is cloned on store and read. Invalidate when reusing an identity
-// for a different credential, or recreate the cache on reconfiguration.
+// matching Provider are required. When the caller knows the credential context
+// (StorageJSON/Metadata/Attributes), include it: the observation is then bound
+// to that credential generation and is never served to a fetch carrying a
+// different credential, which closes the rotated-key-under-reused-identity
+// staleness window (G-K3). Callers without credential context (UsageRecords)
+// store unbound observations, served to any credential of the identity until
+// the TTL expires. Fresh observations take precedence over polls, including
+// older in-flight polls. Data is cloned on store and read. Invalidate when
+// reusing an identity for a different credential without binding context, or
+// recreate the cache on reconfiguration.
 func (q *CachedQuota) Store(r pluginapi.QuotaFetchRequest, out pluginapi.QuotaFetchResponse) error {
 	id, err := q.authID(r)
 	if err != nil {
@@ -171,12 +191,29 @@ func (q *CachedQuota) Store(r pluginapi.QuotaFetchRequest, out pluginapi.QuotaFe
 		return rpcError("invalid_quota", "quota response encoding failed", 500)
 	}
 	e := &quotaEntry{ready: make(chan struct{}), raw: raw}
+	if e.cred, e.hasCred, err = q.credentialBinding(r); err != nil {
+		return err
+	}
 	close(e.ready)
 	q.mu.Lock()
 	e.expires = q.now().Add(QuotaCacheTTL)
 	q.observations[id] = e
 	q.mu.Unlock()
 	return nil
+}
+
+// credentialBinding digests the same credential context key() uses, reporting
+// whether any context was present. Failures mirror key()'s invalid_auth errors
+// so a Store that cannot be keyed is rejected rather than stored unbound.
+func (q *CachedQuota) credentialBinding(r pluginapi.QuotaFetchRequest) ([32]byte, bool, error) {
+	if len(r.StorageJSON) == 0 && len(r.Metadata) == 0 && len(r.Attributes) == 0 {
+		return [32]byte{}, false, nil
+	}
+	key, err := q.key(r)
+	if err != nil {
+		return [32]byte{}, false, err
+	}
+	return key.Credentials, true, nil
 }
 
 // Invalidate discards header observations and all polled credential versions
