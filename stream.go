@@ -38,10 +38,17 @@ const maxStreamEventBytes = 8 << 20
 // Errors pass through; a frame cut short by an error is not delivered. An
 // event over 8 MiB, or a multi-line event that is not one JSON value, ends the
 // stream with an invalid_stream error.
-func frameStreamChunks(ctx context.Context, in <-chan pluginapi.ExecutorStreamChunk, bare bool) <-chan pluginapi.ExecutorStreamChunk {
+// onExit, when non-nil, runs after the parser stops (end of stream, caller
+// cancellation or framing error) so the caller can release the upstream feed:
+// without it a framing error leaves the forwarder blocked on an unread
+// channel while the upstream connection stays open.
+func frameStreamChunks(ctx context.Context, in <-chan pluginapi.ExecutorStreamChunk, bare bool, onExit func()) <-chan pluginapi.ExecutorStreamChunk {
 	out := make(chan pluginapi.ExecutorStreamChunk)
 	go func() {
 		defer close(out)
+		if onExit != nil {
+			defer onExit()
+		}
 		var line []byte   // the current, incomplete line
 		var data []string // data lines of the current event
 		size := 0         // bytes held in data

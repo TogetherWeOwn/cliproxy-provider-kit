@@ -3,6 +3,8 @@ package providerkit
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -100,10 +102,12 @@ func (p Passthrough) ExecuteStream(ctx context.Context, r pluginapi.ExecutorRequ
 			}
 		}
 	}
-	// The host consumes one SSE event per stream chunk; re-frame the raw
+	// The host consumes one SSE event per stream chunk; re-frame SSE
 	// upstream bytes here so every Passthrough caller speaks the host's chunk
 	// contract (bare JSON for OpenAI chat/completions clients, one
 	// "data:"-framed event per chunk otherwise). See frameStreamChunks.
+	// Upstreams that do not speak SSE (a Content-Type other than
+	// text/event-stream) are forwarded unchanged so the host frames them.
 	raw := make(chan pluginapi.ExecutorStreamChunk)
 	go func() {
 		defer close(raw)
@@ -127,7 +131,24 @@ func (p Passthrough) ExecuteStream(ctx context.Context, r pluginapi.ExecutorRequ
 			}
 		}
 	}()
-	return pluginapi.ExecutorStreamResponse{Headers: resp.Headers, Chunks: frameStreamChunks(ctx, raw, clientWantsBareJSON(r))}, nil
+	if !isSSEStream(resp.Headers) {
+		return pluginapi.ExecutorStreamResponse{Headers: resp.Headers, Chunks: raw}, nil
+	}
+	// If framing fails the parser stops reading while the forwarder may still
+	// be blocked sending into raw, so release the upstream when it exits.
+	// cancel is idempotent: the forwarder already defers it.
+	return pluginapi.ExecutorStreamResponse{Headers: resp.Headers, Chunks: frameStreamChunks(ctx, raw, clientWantsBareJSON(r), cancel)}, nil
+}
+
+// isSSEStream reports whether an upstream response speaks SSE and should be
+// re-framed. A missing Content-Type keeps the SSE assumption behind the
+// host's chunk contract; any other type passes through untouched.
+func isSSEStream(h http.Header) bool {
+	ct := h.Get("Content-Type")
+	if ct == "" {
+		return true
+	}
+	return strings.Contains(strings.ToLower(ct), "text/event-stream")
 }
 
 // CountTokens uses TokenCount when supplied. Otherwise it returns an explicitly

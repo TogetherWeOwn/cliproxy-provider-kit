@@ -280,3 +280,25 @@ func TestPassthroughStreamReleasesHostOperation(t *testing.T) {
 		t.Fatal("completed stream leaked its host operation")
 	}
 }
+
+// A non-SSE upstream (Content-Type other than text/event-stream) is forwarded
+// unchanged so the host frames it; only SSE is re-framed.
+func TestPassthroughNonSSEPassesThrough(t *testing.T) {
+	raw := []byte("{\"a\":1}\n{\"b\":2}\n")
+	h := &localHostHTTP{status: 200, headers: http.Header{"Content-Type": {"application/x-ndjson"}}, chunks: []pluginapi.HTTPStreamChunk{{Payload: raw}}}
+	p := echoExecutor()
+	resp, err := p.ExecuteStream(context.Background(), pluginapi.ExecutorRequest{HTTPClient: h})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []byte
+	for c := range resp.Chunks {
+		if c.Err != nil {
+			t.Fatal(c.Err)
+		}
+		got = append(got, c.Payload...)
+	}
+	if string(got) != string(raw) {
+		t.Fatalf("got %q want %q", got, raw)
+	}
+}

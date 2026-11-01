@@ -76,21 +76,33 @@ func makePlugin(host providerkit.Caller) (*providerkit.Runtime, error) {
 }
 
 // stripEchoNamespace removes exactly one leading "echo/" from the payload's
-// model field, if present. Bare ids pass through unchanged.
+// model field, if present. Bare ids pass through unchanged. Only the model
+// member is decoded: every other field keeps its raw JSON so large integers
+// elsewhere in the payload are never rounded through float64.
 func stripEchoNamespace(payload []byte) []byte {
-	var body map[string]any
+	var body map[string]json.RawMessage
 	if err := json.Unmarshal(payload, &body); err != nil {
 		return payload
 	}
-	model, ok := body["model"].(string)
+	rawModel, ok := body["model"]
 	if !ok {
 		return payload
 	}
-	if rest, ok := strings.CutPrefix(model, "echo/"); ok && rest != "" {
-		body["model"] = rest
-		if raw, err := json.Marshal(body); err == nil {
-			return raw
-		}
+	var model string
+	if err := json.Unmarshal(rawModel, &model); err != nil {
+		return payload
+	}
+	rest, ok := strings.CutPrefix(model, "echo/")
+	if !ok || rest == "" {
+		return payload
+	}
+	raw, err := json.Marshal(rest)
+	if err != nil {
+		return payload
+	}
+	body["model"] = raw
+	if out, err := json.Marshal(body); err == nil {
+		return out
 	}
 	return payload
 }

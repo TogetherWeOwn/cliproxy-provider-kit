@@ -68,7 +68,7 @@ func TestFrameStreamChunksBareForOpenAIChat(t *testing.T) {
 	for _, s := range packedUpstream {
 		chunks = append(chunks, streamBytes(s))
 	}
-	got, errs := collectStream(t, frameStreamChunks(context.Background(), streamFeed(chunks...), true))
+	got, errs := collectStream(t, frameStreamChunks(context.Background(), streamFeed(chunks...), true, nil))
 	want := []string{`{"a":1}`, `{"b":2}`, `{"c":3}`, `{"d":4}`, `{"e":5}`}
 	if len(errs) != 0 || !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %q errs %v", got, errs)
@@ -80,7 +80,7 @@ func TestFrameStreamChunksDataFramedForTranslatedRoutes(t *testing.T) {
 	for _, s := range packedUpstream {
 		chunks = append(chunks, streamBytes(s))
 	}
-	got, _ := collectStream(t, frameStreamChunks(context.Background(), streamFeed(chunks...), false))
+	got, _ := collectStream(t, frameStreamChunks(context.Background(), streamFeed(chunks...), false, nil))
 	want := []string{`data: {"a":1}`, `data: {"b":2}`, `data: {"c":3}`, `data: {"d":4}`, `data: {"e":5}`}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %q", got)
@@ -89,7 +89,7 @@ func TestFrameStreamChunksDataFramedForTranslatedRoutes(t *testing.T) {
 
 func TestFrameStreamChunksPassesErrorsThrough(t *testing.T) {
 	boom := errors.New("boom")
-	got, errs := collectStream(t, frameStreamChunks(context.Background(), streamFeed(streamBytes("data: {\"a\":1}\n\ndata: {\"trunc"), pluginapi.ExecutorStreamChunk{Payload: []byte("ated\":"), Err: boom}), false))
+	got, errs := collectStream(t, frameStreamChunks(context.Background(), streamFeed(streamBytes("data: {\"a\":1}\n\ndata: {\"trunc"), pluginapi.ExecutorStreamChunk{Payload: []byte("ated\":"), Err: boom}), false, nil))
 	// Complete events before the error are delivered; a truncated frame is not.
 	if !reflect.DeepEqual(got, []string{`data: {"a":1}`}) || len(errs) != 1 || !errors.Is(errs[0], boom) {
 		t.Fatalf("got %q errs %v", got, errs)
@@ -99,7 +99,7 @@ func TestFrameStreamChunksPassesErrorsThrough(t *testing.T) {
 func TestFrameStreamChunksStopsOnCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	in := make(chan pluginapi.ExecutorStreamChunk)
-	out := frameStreamChunks(ctx, in, true)
+	out := frameStreamChunks(ctx, in, true, nil)
 	cancel()
 	select {
 	case _, ok := <-out:
@@ -135,7 +135,7 @@ func TestFrameStreamChunksBoundsAnEvent(t *testing.T) {
 	for i := range big {
 		big[i] = 'x'
 	}
-	got, errs := collectStream(t, frameStreamChunks(context.Background(), streamFeed(streamBytes("data: {\"a\":1}\n\ndata: "), pluginapi.ExecutorStreamChunk{Payload: big}), true))
+	got, errs := collectStream(t, frameStreamChunks(context.Background(), streamFeed(streamBytes("data: {\"a\":1}\n\ndata: "), pluginapi.ExecutorStreamChunk{Payload: big}), true, nil))
 	if !reflect.DeepEqual(got, []string{`{"a":1}`}) || len(errs) != 1 || streamRPC(t, errs[0]).Code != "invalid_stream" {
 		t.Fatalf("got %d events, errs %v", len(got), errs)
 	}
@@ -145,14 +145,14 @@ func TestFrameStreamChunksBoundsAnEvent(t *testing.T) {
 func TestFrameStreamChunksBoundsACompletedEvent(t *testing.T) {
 	big := bytes.Repeat([]byte("x"), maxStreamEventBytes)
 	payload := append(append([]byte("data: {\"a\":1}\n\ndata: "), big...), []byte("\ndata: y\n\n")...)
-	got, errs := collectStream(t, frameStreamChunks(context.Background(), streamFeed(pluginapi.ExecutorStreamChunk{Payload: payload}), true))
+	got, errs := collectStream(t, frameStreamChunks(context.Background(), streamFeed(pluginapi.ExecutorStreamChunk{Payload: payload}), true, nil))
 	if !reflect.DeepEqual(got, []string{`{"a":1}`}) || len(errs) != 1 || streamRPC(t, errs[0]).Code != "invalid_stream" {
 		t.Fatalf("got %d events, errs %v", len(got), errs)
 	}
 }
 
 func TestFrameStreamChunksRefusesMultiLineNonJSON(t *testing.T) {
-	got, errs := collectStream(t, frameStreamChunks(context.Background(), streamFeed(streamBytes("data: {\"a\":1}\n\ndata: not\ndata: json\n\ndata: {\"b\":2}\n\n")), false))
+	got, errs := collectStream(t, frameStreamChunks(context.Background(), streamFeed(streamBytes("data: {\"a\":1}\n\ndata: not\ndata: json\n\ndata: {\"b\":2}\n\n")), false, nil))
 	if !reflect.DeepEqual(got, []string{`data: {"a":1}`}) || len(errs) != 1 || streamRPC(t, errs[0]).Code != "invalid_stream" {
 		t.Fatalf("got %q errs %v", got, errs)
 	}
@@ -198,5 +198,24 @@ func TestPassthroughExecuteStreamBareForChatRoute(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, []string{`{"a":1}`}) {
 		t.Fatalf("got %q", got)
+	}
+}
+
+func TestFrameStreamChunksCallsOnExit(t *testing.T) {
+	// On a framing error the parser must run onExit so the caller can release
+	// the upstream feed instead of stranding it.
+	called := false
+	_, errs := collectStream(t, frameStreamChunks(context.Background(), streamFeed(streamBytes("data: not\ndata: json\n\n")), false, func() { called = true }))
+	if len(errs) != 1 || streamRPC(t, errs[0]).Code != "invalid_stream" {
+		t.Fatalf("errs %v", errs)
+	}
+	if !called {
+		t.Fatal("onExit not called after framing error")
+	}
+	// Normal completion runs it too.
+	called = false
+	got, errs := collectStream(t, frameStreamChunks(context.Background(), streamFeed(streamBytes("data: {\"a\":1}\n\n")), false, func() { called = true }))
+	if len(errs) != 0 || !reflect.DeepEqual(got, []string{`data: {"a":1}`}) || !called {
+		t.Fatalf("got %q errs %v called %v", got, errs, called)
 	}
 }

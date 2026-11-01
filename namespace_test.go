@@ -129,11 +129,13 @@ func TestRegistrationPathsEnforceNamespace(t *testing.T) {
 		t.Fatalf("registrations = %+v", reg.Registrations)
 	}
 	if got := modelIDs(reg.Registrations[0].Models); !equalStrings(got, want) {
-		// The provider's cached Registrations entries must keep their originals.
-		if got := modelIDs(stub.register.Registrations[0].Models); len(got) != 7 {
-			t.Fatalf("provider registrations mutated: %q", got)
-		}
 		t.Fatalf("registration entry models = %q, want %q", got, want)
+	}
+	// The provider's cached Registrations entries must keep their originals.
+	// This runs unconditionally so mutation is caught even when filtering
+	// otherwise succeeds.
+	if got := modelIDs(stub.register.Registrations[0].Models); len(got) != 7 {
+		t.Fatalf("provider registrations mutated: %q", got)
 	}
 
 	var static pluginapi.ModelResponse
