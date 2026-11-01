@@ -178,15 +178,37 @@ func TestLoginFileNameDerivation(t *testing.T) {
 }
 
 // TestLoginFilenameLowercaseKeepsRepeatLoginIdempotent reproduces the
-// mixed-case repeat login: a provider canonicalizes account_id to lowercase
-// in Parse and keys its identity on that, so mixed-case submissions must
-// mint one filename when the field declares LowercaseForFilename.
+// mixed-case repeat login end to end: the provider canonicalizes
+// account_id to lowercase during Parse (via Validate), keys its identity
+// on the canonical value, and rejects a second filename for that identity
+// as duplicate_auth. Mixed-case submissions must therefore mint one
+// filename when the field declares LowercaseForFilename; without the fold
+// the second submission below fails with duplicate_auth.
 func TestLoginFilenameLowercaseKeepsRepeatLoginIdempotent(t *testing.T) {
-	echoAuth := APIKeyAuth{Provider: "echo"}
+	echoAuth := APIKeyAuth{Provider: "echo", Validate: func(fields map[string]any) error {
+		account, _ := fields["account_id"].(string)
+		fields["account_id"] = strings.ToLower(strings.TrimSpace(account))
+		return nil
+	}}
+	owners := map[string]string{}
 	var parsed []string
 	parse := func(ctx context.Context, req pluginapi.AuthParseRequest) (pluginapi.AuthParseResponse, error) {
 		parsed = append(parsed, req.FileName)
-		return echoAuth.ParseAuth(ctx, req)
+		out, err := echoAuth.ParseAuth(ctx, req)
+		if err != nil || !out.Handled {
+			return out, err
+		}
+		var store map[string]any
+		if err := json.Unmarshal(out.Auth.StorageJSON, &store); err != nil {
+			return pluginapi.AuthParseResponse{}, err
+		}
+		identity := store["account_id"].(string) + "\x00" + store["api_key"].(string)
+		if file, ok := owners[identity]; ok && file != req.FileName {
+			return pluginapi.AuthParseResponse{}, &pluginabi.Error{Code: "duplicate_auth",
+				Message: "account and token already configured in another auth file", HTTPStatus: 400}
+		}
+		owners[identity] = req.FileName
+		return out, nil
 	}
 	login, err := NewAPIKeyLogin(APIKeyLoginConfig{Provider: "echo", Parse: parse,
 		Fields:         []APIKeyLoginField{{Name: "account_id", Label: "Account ID", Required: true, LowercaseForFilename: true}},
@@ -214,10 +236,11 @@ func TestLoginFilenameLowercaseKeepsRepeatLoginIdempotent(t *testing.T) {
 		if out.Status != pluginapi.AuthLoginStatusSuccess {
 			t.Fatalf("poll %+v", out)
 		}
-		// The fold is filename-only: Parse still sees the value as submitted.
+		// The fold is filename-only: the stored value is exactly what the
+		// provider's own canonicalization produced from the submission.
 		var store map[string]any
-		if err := json.Unmarshal(out.Auth.StorageJSON, &store); err != nil || store["account_id"] != account {
-			t.Fatalf("stored value folded: %s", out.Auth.StorageJSON)
+		if err := json.Unmarshal(out.Auth.StorageJSON, &store); err != nil || store["account_id"] != strings.ToLower(account) {
+			t.Fatalf("stored value not provider-canonicalized: %s", out.Auth.StorageJSON)
 		}
 		return out.Auth.FileName
 	}
