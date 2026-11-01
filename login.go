@@ -9,6 +9,7 @@ import (
 	"html"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -70,13 +71,24 @@ const (
 	defaultManagementBase  = "/v0/management"
 )
 
+// loginProviderPattern bounds Provider to shell- and path-safe characters.
+// The provider key is interpolated into the login page's shell prompts (inside
+// single quotes), the management submit path, and the deterministic auth file
+// name, so anything outside [A-Za-z0-9-] (backslash, $, backticks, quotes,
+// slashes, dots) is rejected at config time instead of only documented.
+var loginProviderPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9-]{0,63}$`)
+
+// loginFieldPattern bounds field names to [A-Za-z0-9_]. A name is interpolated
+// into the login page's unquoted heredoc body, so anything else (backslash, $,
+// backticks) would be interpreted by the operator's shell instead of arriving
+// literally.
+var loginFieldPattern = regexp.MustCompile(`^[A-Za-z0-9_]{1,64}$`)
+
 // APIKeyLoginField describes one provider-owned auth field, beyond api_key
 // and label, that the login page documents and the submit endpoint accepts.
 type APIKeyLoginField struct {
-	// Name is the JSON key accepted by the submit endpoint. It is also
-	// interpolated into the login page's unquoted heredoc body, so keep it
-	// to [A-Za-z0-9_]: anything else (backslash, $, backticks) would be
-	// interpreted by the operator's shell instead of arriving literally.
+	// Name is the JSON key accepted by the submit endpoint. NewAPIKeyLogin
+	// enforces the [A-Za-z0-9_] charset (see loginFieldPattern).
 	Name string
 	// Label is the short human-readable name shown on the login page.
 	Label string
@@ -89,6 +101,8 @@ type APIKeyLoginField struct {
 // APIKeyLoginConfig wires provider behavior into the login helper.
 type APIKeyLoginConfig struct {
 	// Provider is the provider key; it must match the APIKeyAuth provider.
+	// NewAPIKeyLogin enforces the shell-safe charset (see
+	// loginProviderPattern).
 	Provider string
 	// Parse is the provider's full ParseAuth pipeline, including validation
 	// and the duplicate-key guard.
@@ -140,8 +154,8 @@ type APIKeyLogin struct {
 // leaves StartLogin failing with login_unavailable.
 func NewAPIKeyLogin(cfg APIKeyLoginConfig) (*APIKeyLogin, error) {
 	provider := strings.TrimSpace(cfg.Provider)
-	if provider == "" || strings.Contains(provider, "..") || strings.ContainsAny(provider, "/\\ \t\r\n") {
-		return nil, rpcError("invalid_login", "login provider must be a bare provider key", 500)
+	if !loginProviderPattern.MatchString(provider) {
+		return nil, rpcError("invalid_login", "login provider must match [A-Za-z0-9][A-Za-z0-9-]{0,63}", 500)
 	}
 	if cfg.Parse == nil {
 		return nil, rpcError("invalid_login", "login requires the provider ParseAuth pipeline", 500)
@@ -149,8 +163,8 @@ func NewAPIKeyLogin(cfg APIKeyLoginConfig) (*APIKeyLogin, error) {
 	byName := make(map[string]APIKeyLoginField, len(cfg.Fields))
 	for _, f := range cfg.Fields {
 		name := strings.TrimSpace(f.Name)
-		if name == "" {
-			return nil, rpcError("invalid_login", "login field names must be nonempty", 500)
+		if !loginFieldPattern.MatchString(name) {
+			return nil, rpcError("invalid_login", "login field names must match [A-Za-z0-9_]{1,64}", 500)
 		}
 		switch name {
 		case "type", "id", "state", "api_key", "label":
@@ -449,7 +463,9 @@ func (l *APIKeyLogin) servePage(req pluginapi.ManagementRequest) pluginapi.Manag
 			html.EscapeString(l.provider) + " Login</b> again to get a fresh login page.</p>")
 	} else {
 		b.WriteString("<p>Paste the block below into <b>bash or zsh</b> on any machine that reaches the CLIProxy host. " +
-			"Set CLIPROXY_BASE to the host's public base URL (for example http://host:port). " +
+			"Set CLIPROXY_BASE to the host's public base URL (for example https://host:port). " +
+			"On a remote host always use https:// so the management key and the API key are encrypted in transit; " +
+			"plain http:// is only acceptable on a loopback address you trust. " +
 			"The secrets are read with hidden input and travel over stdin only: they never appear in the pasted text, " +
 			"shell history, process arguments, URLs, or logs. " +
 			"The key travels in the POST body only.</p>")
