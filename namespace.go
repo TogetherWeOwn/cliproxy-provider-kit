@@ -49,21 +49,19 @@ func namespaced(ns, id string) bool {
 }
 
 // filterModels drops every model whose id is not namespaced under ns, logging
-// each drop. It returns the surviving models, never a bare id.
+// each drop. It returns the surviving models, never a bare id, without
+// mutating the provider's slice.
 func filterModels(ns string, models []pluginapi.ModelInfo) []pluginapi.ModelInfo {
 	if len(models) == 0 {
 		return models
 	}
-	kept := models[:0]
+	kept := make([]pluginapi.ModelInfo, 0, len(models))
 	for _, m := range models {
 		if !namespaced(ns, m.ID) {
 			log.Printf("providerkit: dropping model %q: id must start with %q exactly once", m.ID, ns+"/")
 			continue
 		}
 		kept = append(kept, m)
-	}
-	for i := len(kept); i < len(models); i++ {
-		models[i] = pluginapi.ModelInfo{}
 	}
 	return kept
 }

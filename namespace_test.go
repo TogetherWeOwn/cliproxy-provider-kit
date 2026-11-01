@@ -117,6 +117,10 @@ func TestRegistrationPathsEnforceNamespace(t *testing.T) {
 	} else {
 		decodeResult(t, env.Result, &reg)
 	}
+	// Filtering must not mutate the provider's own lists.
+	if got := modelIDs(stub.register.Models); len(got) != 6 {
+		t.Fatalf("provider slice mutated: %q", got)
+	}
 	if got := modelIDs(reg.Models); !equalStrings(got, want) {
 		t.Fatalf("register models = %q, want %q", got, want)
 	}
