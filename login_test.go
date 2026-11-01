@@ -76,24 +76,29 @@ func TestLoginConfigValidation(t *testing.T) {
 	echoAuth := APIKeyAuth{Provider: "echo"}
 	parse := echoAuth.ParseAuth
 	for name, cfg := range map[string]APIKeyLoginConfig{
-		"blank provider":     {Provider: " ", Parse: parse},
-		"path traversal":     {Provider: "a/../b", Parse: parse},
-		"slash":              {Provider: "a/b", Parse: parse},
-		"shell provider":     {Provider: "a$b`c", Parse: parse},
-		"quoted provider":    {Provider: `a'b"c`, Parse: parse},
-		"leading dash":       {Provider: "-echo", Parse: parse},
-		"nil parse":          {Provider: "echo"},
-		"blank field":        {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{}}},
-		"shell field":        {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "a$b"}}},
-		"backtick field":     {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "a`b"}}},
-		"dashed field":       {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "a-b"}}},
-		"dotted field":       {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "a.b"}}},
-		"spaced field":       {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "a b"}}},
-		"reserved field":     {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "api_key"}}},
-		"host-managed field": {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "weight"}}},
-		"duplicate field":    {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "x"}, {Name: "x"}}},
-		"reserved id":        {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "id"}}},
-		"shell collision":    {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "Region"}, {Name: "region"}}},
+		"blank provider":      {Provider: " ", Parse: parse},
+		"path traversal":      {Provider: "a/../b", Parse: parse},
+		"slash":               {Provider: "a/b", Parse: parse},
+		"shell provider":      {Provider: "a$b`c", Parse: parse},
+		"quoted provider":     {Provider: `a'b"c`, Parse: parse},
+		"leading dash":        {Provider: "-echo", Parse: parse},
+		"nil parse":           {Provider: "echo"},
+		"blank field":         {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{}}},
+		"shell field":         {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "a$b"}}},
+		"backtick field":      {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "a`b"}}},
+		"dashed field":        {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "a-b"}}},
+		"dotted field":        {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "a.b"}}},
+		"spaced field":        {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "a b"}}},
+		"reserved field":      {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "api_key"}}},
+		"host-managed field":  {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "weight"}}},
+		"duplicate field":     {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "x"}, {Name: "x"}}},
+		"reserved id":         {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "id"}}},
+		"shell collision":     {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "Region"}, {Name: "region"}}},
+		"filename api_key":    {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "region"}}, FilenameFields: []string{"api_key"}},
+		"filename unknown":    {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "region"}}, FilenameFields: []string{"account_id"}},
+		"filename undeclared": {Provider: "echo", Parse: parse, FilenameFields: []string{"account_id"}},
+		"filename blank":      {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "region"}}, FilenameFields: []string{" "}},
+		"filename duplicate":  {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "region"}}, FilenameFields: []string{"region", " region "}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := NewAPIKeyLogin(cfg); err == nil {
@@ -110,6 +115,51 @@ func TestLoginConfigValidation(t *testing.T) {
 	if _, err := NewAPIKeyLogin(APIKeyLoginConfig{Provider: "cloudflare-workers-ai", Parse: parse,
 		Fields: []APIKeyLoginField{{Name: "account_id"}, {Name: "daily_free_neurons2"}}}); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := NewAPIKeyLogin(APIKeyLoginConfig{Provider: "cloudflare-workers-ai", Parse: parse,
+		Fields:         []APIKeyLoginField{{Name: "account_id", Required: true}},
+		FilenameFields: []string{" account_id "}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestLoginFileNameDerivation pins the pure derivation: no filename fields
+// keeps the historical key-only name, listed fields distinguish identities
+// that share a key, and field boundaries cannot alias.
+func TestLoginFileNameDerivation(t *testing.T) {
+	legacy, err := loginFileName("echo", "example-key", nil, map[string]any{"account_id": "ac-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacy != "echo-c018c41c1afa.json" {
+		t.Fatalf("key-only derivation changed: %q", legacy)
+	}
+	name := func(candidate map[string]any) string {
+		t.Helper()
+		out, err := loginFileName("echo", "example-key", []string{"account_id", "region"}, candidate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	first := name(map[string]any{"account_id": "ac-1", "region": "eu"})
+	if first == legacy {
+		t.Fatalf("filename fields ignored: %q", first)
+	}
+	if again := name(map[string]any{"account_id": " ac-1 ", "region": "eu"}); again != first {
+		t.Fatalf("same identity not idempotent: %q != %q", again, first)
+	}
+	if other := name(map[string]any{"account_id": "ac-2", "region": "eu"}); other == first {
+		t.Fatalf("distinct identities share a filename: %q", other)
+	}
+	if shifted := name(map[string]any{"account_id": "ac-1eu", "region": ""}); shifted == first {
+		t.Fatal("values shifted across fields alias another identity")
+	}
+	if omitted := name(map[string]any{"account_id": "ac-1"}); omitted == first {
+		t.Fatalf("omitted optional filename field aliases a present one: %q", omitted)
+	}
+	if strings.Contains(first, "example-key") || strings.Contains(first, "ac-1") {
+		t.Fatalf("filename leaks submitted values: %q", first)
 	}
 }
 
@@ -513,6 +563,90 @@ func TestLoginRequiredFields(t *testing.T) {
 	var store map[string]any
 	if err := json.Unmarshal(out.Auth.StorageJSON, &store); err != nil || store["region"] != "eu" {
 		t.Fatalf("extra field lost: %s", out.Auth.StorageJSON)
+	}
+}
+
+// TestLoginFilenameFieldsDistinctIdentities reproduces the collision from
+// kit issue #15 end to end: one key reused under two account IDs must reach
+// Parse under two distinct file names (Parse keys its ownership map on the
+// file name the kit mints), while the same identity submitted again keeps
+// its name. Without FilenameFields the required field alone does not change
+// the historical key-only name.
+func TestLoginFilenameFieldsDistinctIdentities(t *testing.T) {
+	echoAuth := APIKeyAuth{Provider: "echo"}
+	var parsed []string
+	parse := func(ctx context.Context, req pluginapi.AuthParseRequest) (pluginapi.AuthParseResponse, error) {
+		parsed = append(parsed, req.FileName)
+		return echoAuth.ParseAuth(ctx, req)
+	}
+	login, err := NewAPIKeyLogin(APIKeyLoginConfig{Provider: "echo", Parse: parse,
+		Fields:         []APIKeyLoginField{{Name: "account_id", Label: "Account ID", Required: true}},
+		FilenameFields: []string{"account_id"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := loginRuntime(t, login)
+	complete := func(account string) pluginapi.AuthLoginPollResponse {
+		t.Helper()
+		start := startLogin(t, r)
+		resp := manage(t, r, pluginapi.ManagementRequest{Method: "POST", Path: loginSubmitPath,
+			Body: []byte(`{"state":"` + start.State + `","api_key":"example-key","account_id":"` + account + `"}`)})
+		if resp.StatusCode != 200 {
+			t.Fatalf("submit %+v", resp)
+		}
+		env := rpc(t, r, "auth.login.poll", pluginapi.AuthLoginPollRequest{State: start.State})
+		if !env.OK {
+			t.Fatalf("poll: %+v", env.Error)
+		}
+		var out pluginapi.AuthLoginPollResponse
+		if err := json.Unmarshal(env.Result, &out); err != nil {
+			t.Fatal(err)
+		}
+		if out.Status != pluginapi.AuthLoginStatusSuccess {
+			t.Fatalf("poll %+v", out)
+		}
+		return out
+	}
+	first, second, again := complete("ac-1"), complete("ac-2"), complete("ac-1")
+	if first.Auth.FileName == second.Auth.FileName {
+		t.Fatalf("same key under two accounts still collides: %q", first.Auth.FileName)
+	}
+	if again.Auth.FileName != first.Auth.FileName {
+		t.Fatalf("same identity not idempotent: %q != %q", again.Auth.FileName, first.Auth.FileName)
+	}
+	if first.Auth.FileName == "echo-c018c41c1afa.json" || second.Auth.FileName == "echo-c018c41c1afa.json" {
+		t.Fatal("filename fields fell back to the key-only name")
+	}
+	// Parse must have been handed exactly the names PollLogin delivered, in
+	// order: that name is what a provider's ownership map records.
+	want := []string{first.Auth.FileName, second.Auth.FileName, first.Auth.FileName}
+	if strings.Join(parsed, ",") != strings.Join(want, ",") {
+		t.Fatalf("Parse filenames %v, want %v", parsed, want)
+	}
+
+	// No FilenameFields: a required field alone keeps the legacy name, so
+	// providers that never opted in see no file-name churn.
+	legacyLogin, err := NewAPIKeyLogin(APIKeyLoginConfig{Provider: "echo", Parse: echoAuth.ParseAuth,
+		Fields: []APIKeyLoginField{{Name: "account_id", Label: "Account ID", Required: true}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyRuntime := loginRuntime(t, legacyLogin)
+	start := startLogin(t, legacyRuntime)
+	if resp := manage(t, legacyRuntime, pluginapi.ManagementRequest{Method: "POST", Path: loginSubmitPath,
+		Body: []byte(`{"state":"` + start.State + `","api_key":"example-key","account_id":"ac-1"}`)}); resp.StatusCode != 200 {
+		t.Fatalf("legacy submit %+v", resp)
+	}
+	env := rpc(t, legacyRuntime, "auth.login.poll", pluginapi.AuthLoginPollRequest{State: start.State})
+	if !env.OK {
+		t.Fatalf("legacy poll: %+v", env.Error)
+	}
+	var legacy pluginapi.AuthLoginPollResponse
+	if err := json.Unmarshal(env.Result, &legacy); err != nil {
+		t.Fatal(err)
+	}
+	if legacy.Auth.FileName != "echo-c018c41c1afa.json" {
+		t.Fatalf("default derivation changed: %q", legacy.Auth.FileName)
 	}
 }
 

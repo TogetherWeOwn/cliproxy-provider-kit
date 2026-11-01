@@ -55,8 +55,10 @@ import (
 //     headers the host forwards).
 //  3. The submit handler runs the provider's full ParseAuth pipeline,
 //     including provider validation and the duplicate-key guard, against a
-//     deterministic file name derived from the key digest, so submitting the
-//     same key twice is idempotent instead of a duplicate. The validated
+//     deterministic file name derived from the key digest (plus any fields
+//     declared in FilenameFields, for identities that span extra fields),
+//     so submitting the same identity twice is idempotent instead of a
+//     duplicate. The validated
 //     AuthData is kept in the memory-only session; PollLogin delivers it to
 //     exactly one poller, then keeps a credential-free tombstone until expiry
 //     so a concurrent second poller waits instead of failing the host login.
@@ -112,6 +114,21 @@ type APIKeyLoginConfig struct {
 	Parse func(context.Context, pluginapi.AuthParseRequest) (pluginapi.AuthParseResponse, error)
 	// Fields documents extra provider-owned auth fields.
 	Fields []APIKeyLoginField
+	// FilenameFields lists declared Fields whose submitted values, in
+	// addition to the API key, determine the deterministic auth file name
+	// passed to Parse. Providers whose identity spans extra fields (for
+	// example an account ID plus a token that may be reused across
+	// accounts) must list those fields here: with the key-only default, two
+	// identities sharing a key would mint the same file name and the second
+	// ParseAuth would overwrite the first identity's ownership entry.
+	// Empty (the default) keeps the historical key-only derivation, so
+	// existing providers' file names are unchanged. Values are hashed as
+	// submitted (strings trimmed); provider-side normalization inside Parse
+	// (such as lower-casing) is not reflected, so identity fields should be
+	// submitted in canonical form. A listed optional field that is omitted
+	// or blank contributes no value. Providers using FilenameFields
+	// should also derive distinct Auth IDs for distinct identities in Parse.
+	FilenameFields []string
 	// SessionTTL bounds a pending login; defaults to 15 minutes.
 	SessionTTL time.Duration
 }
@@ -135,11 +152,12 @@ type loginSession struct {
 // APIKeyAuth.Login) and the pluginapi.ManagementAPI plus
 // pluginapi.ManagementHandler halves for Capabilities.ManagementAPI.
 type APIKeyLogin struct {
-	provider string
-	parse    func(context.Context, pluginapi.AuthParseRequest) (pluginapi.AuthParseResponse, error)
-	fields   []APIKeyLoginField
-	byName   map[string]APIKeyLoginField
-	ttl      time.Duration
+	provider       string
+	parse          func(context.Context, pluginapi.AuthParseRequest) (pluginapi.AuthParseResponse, error)
+	fields         []APIKeyLoginField
+	filenameFields []string
+	byName         map[string]APIKeyLoginField
+	ttl            time.Duration
 
 	mu           sync.Mutex
 	sessions     map[string]*loginSession
@@ -195,6 +213,27 @@ func NewAPIKeyLogin(cfg APIKeyLoginConfig) (*APIKeyLogin, error) {
 		}
 		seenVars[v] = strings.TrimSpace(f.Name)
 	}
+	// FilenameFields must name declared Fields: the submit endpoint rejects
+	// undeclared fields, so an undeclared name could never contribute a
+	// value and would silently keep the colliding key-only derivation.
+	// api_key is rejected rather than ignored because it is always part of
+	// the derivation; listing it would suggest it is somehow optional.
+	filenameFields := make([]string, 0, len(cfg.FilenameFields))
+	seenFilenameFields := make(map[string]bool, len(cfg.FilenameFields))
+	for _, rawName := range cfg.FilenameFields {
+		name := strings.TrimSpace(rawName)
+		if name == "api_key" {
+			return nil, rpcError("invalid_login", "api_key is always a login filename input and must not be listed in FilenameFields", 500)
+		}
+		if _, ok := byName[name]; !ok {
+			return nil, rpcError("invalid_login", "login filename field must name a declared login field", 500)
+		}
+		if seenFilenameFields[name] {
+			return nil, rpcError("invalid_login", "duplicate login filename field", 500)
+		}
+		seenFilenameFields[name] = true
+		filenameFields = append(filenameFields, name)
+	}
 	ttl := cfg.SessionTTL
 	if ttl <= 0 {
 		ttl = defaultLoginSessionTTL
@@ -204,8 +243,42 @@ func NewAPIKeyLogin(cfg APIKeyLoginConfig) (*APIKeyLogin, error) {
 		f.Name = strings.TrimSpace(f.Name)
 		fields = append(fields, f)
 	}
-	return &APIKeyLogin{provider: provider, parse: cfg.Parse, fields: fields, byName: byName, ttl: ttl,
-		sessions: make(map[string]*loginSession), mgmtBase: defaultManagementBase}, nil
+	return &APIKeyLogin{provider: provider, parse: cfg.Parse, fields: fields, filenameFields: filenameFields,
+		byName: byName, ttl: ttl, sessions: make(map[string]*loginSession), mgmtBase: defaultManagementBase}, nil
+}
+
+// loginFileName derives the deterministic auth file name for one login
+// identity. With no filename fields it is the historical key-only digest, so
+// existing providers keep their current file names. With filename fields,
+// each field's name and JSON-encoded submitted value (strings trimmed, an
+// omitted optional field as JSON null) is hashed after the key with NUL
+// separators, so distinct identities that share a key mint distinct names
+// and no split of values across fields can alias another identity. The
+// digest is truncated exactly like the key-only form, and neither the key
+// nor any field value appears in the name.
+func loginFileName(provider, key string, filenameFields []string, candidate map[string]any) (string, error) {
+	if len(filenameFields) == 0 {
+		digest := sha256.Sum256([]byte(key))
+		return provider + "-" + hex.EncodeToString(digest[:6]) + ".json", nil
+	}
+	h := sha256.New()
+	h.Write([]byte(key))
+	for _, name := range filenameFields {
+		value := candidate[name]
+		if s, ok := value.(string); ok {
+			value = strings.TrimSpace(s)
+		}
+		raw, err := json.Marshal(value)
+		if err != nil {
+			return "", err
+		}
+		h.Write([]byte{0})
+		h.Write([]byte(name))
+		h.Write([]byte{0})
+		h.Write(raw)
+	}
+	digest := h.Sum(nil)
+	return provider + "-" + hex.EncodeToString(digest[:6]) + ".json", nil
 }
 
 func (l *APIKeyLogin) evictLocked(now time.Time) {
@@ -623,11 +696,15 @@ func (l *APIKeyLogin) serveSubmit(ctx context.Context, req pluginapi.ManagementR
 	if err != nil {
 		return loginJSONError(http.StatusBadRequest, "invalid_auth", "cannot encode auth storage")
 	}
-	// The deterministic, key-derived file name makes a repeated submission of
-	// the same key overwrite the same pending session instead of tripping the
-	// provider's duplicate-key guard.
-	digest := sha256.Sum256([]byte(key))
-	fileName := l.provider + "-" + hex.EncodeToString(digest[:6]) + ".json"
+	// The deterministic file name (derived from the key, plus any declared
+	// FilenameFields) makes a repeated submission of the same identity
+	// overwrite the same pending session instead of tripping the provider's
+	// duplicate-key guard, while distinct identities sharing a key mint
+	// distinct names instead of overwriting each other's ownership entry.
+	fileName, err := loginFileName(l.provider, key, l.filenameFields, candidate)
+	if err != nil {
+		return loginJSONError(http.StatusBadRequest, "invalid_auth", "cannot encode auth storage")
+	}
 	path := fileName
 	if s.authDir != "" {
 		path = strings.TrimRight(s.authDir, "/") + "/" + fileName
