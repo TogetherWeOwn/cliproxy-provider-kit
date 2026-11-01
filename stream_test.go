@@ -177,6 +177,19 @@ func TestFrameStreamChunksCRDelimitedFlushesWithoutMoreInput(t *testing.T) {
 	}
 }
 
+// An empty chunk between CR and LF must not clear the pending LF swallow:
+// the three chunks below are one two-line event, not two events.
+func TestFrameStreamChunksEmptyChunkBetweenCRAndLF(t *testing.T) {
+	got, errs := collectStream(t, frameStreamChunks(context.Background(), streamFeed(
+		streamBytes("data: {\"a\":\r"),
+		streamBytes(""),
+		streamBytes("\ndata: 1}\n\n"),
+	), true, nil))
+	if len(errs) != 0 || !reflect.DeepEqual(got, []string{`{"a":1}`}) {
+		t.Fatalf("got %q errs %v", got, errs)
+	}
+}
+
 func TestFrameStreamChunksBoundsEmptyLines(t *testing.T) {
 	// Every data line advances the event bound, even empty ones: an event
 	// of blank data lines with no terminator must still trip it.

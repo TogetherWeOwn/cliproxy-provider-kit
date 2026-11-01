@@ -127,9 +127,13 @@ func frameStreamChunks(ctx context.Context, in <-chan pluginapi.ExecutorStreamCh
 						return dispatch()
 					}
 					buf := append(line, c.Payload...)
-					if skipLF {
+					// Only a nonempty read advances past the CR: an
+					// empty chunk carries no byte, so it must not
+					// clear the pending LF swallow (buf is nonempty
+					// here whenever the payload is).
+					if skipLF && len(c.Payload) > 0 {
 						skipLF = false
-						if len(buf) > 0 && buf[0] == '\n' {
+						if buf[0] == '\n' {
 							buf = buf[1:]
 						}
 					}
