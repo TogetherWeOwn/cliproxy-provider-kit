@@ -42,7 +42,7 @@ func newRuntime(t *testing.T, d Definition, h Caller) *Runtime {
 }
 func register(t *testing.T, r *Runtime) {
 	t.Helper()
-	e := rpc(t, r, "plugin.register", map[string]any{"schema_version": 9})
+	e := rpc(t, r, "plugin.register", map[string]any{"schema_version": 10})
 	if !e.OK {
 		t.Fatalf("register: %+v", e.Error)
 	}
@@ -55,7 +55,7 @@ func TestRuntimeLifecycle(t *testing.T) {
 	if e.OK || e.Error.Code != "not_ready" {
 		t.Fatalf("before register: %+v", e)
 	}
-	e = rpc(t, r, "plugin.register", map[string]any{"schema_version": 9, "config_yaml": []byte("enabled: true\n")})
+	e = rpc(t, r, "plugin.register", map[string]any{"schema_version": 10, "config_yaml": []byte("enabled: true\n")})
 	if !e.OK {
 		t.Fatal(e.Error)
 	}
@@ -64,7 +64,7 @@ func TestRuntimeLifecycle(t *testing.T) {
 		Metadata      pluginapi.Metadata `json:"metadata"`
 	}
 	json.Unmarshal(e.Result, &reg)
-	if reg.SchemaVersion != 9 || reg.Metadata.Name != "echo" {
+	if reg.SchemaVersion != 10 || reg.Metadata.Name != "echo" {
 		t.Fatalf("registration: %+v", reg)
 	}
 	if e = rpc(t, r, "plugin.quiesce", nil); !e.OK {
@@ -73,7 +73,7 @@ func TestRuntimeLifecycle(t *testing.T) {
 	if e = rpc(t, r, "auth.identifier", nil); e.OK || e.Error.Code != "not_ready" {
 		t.Fatalf("quiesced: %+v", e)
 	}
-	if e = rpc(t, r, "plugin.reconfigure", map[string]any{"schema_version": 9, "config_yaml": []byte("enabled: false\n")}); !e.OK {
+	if e = rpc(t, r, "plugin.reconfigure", map[string]any{"schema_version": 10, "config_yaml": []byte("enabled: false\n")}); !e.OK {
 		t.Fatal(e.Error)
 	}
 	if len(configs) != 2 || configs[0] != "enabled: true\n" || configs[1] != "enabled: false\n" {
@@ -87,7 +87,7 @@ func TestRuntimeLifecycle(t *testing.T) {
 	if stopped != 1 {
 		t.Fatalf("shutdown count %d", stopped)
 	}
-	if e = rpc(t, r, "plugin.register", map[string]any{"schema_version": 9}); e.OK {
+	if e = rpc(t, r, "plugin.register", map[string]any{"schema_version": 10}); e.OK {
 		t.Fatal("resurrected shutdown runtime")
 	}
 }
@@ -112,14 +112,14 @@ func TestMetadataValidation(t *testing.T) {
 	}
 }
 
-// A newer host (schema 10, CLIProxyAPI v8.0.49) registers the plugin, which
-// answers with the kit's own schema so the host gates newer features.
+// A newer host (schema 11) registers the plugin, which answers with the kit's
+// own schema so the host gates newer features.
 func TestNewerHostSchemaIsAccepted(t *testing.T) {
 	r := newRuntime(t, Definition{Metadata: metadata()}, nil)
 	var e pluginabi.Envelope
-	json.Unmarshal(r.Call(context.Background(), "plugin.register", []byte(`{"schema_version":10}`)), &e)
+	json.Unmarshal(r.Call(context.Background(), "plugin.register", []byte(`{"schema_version":11}`)), &e)
 	if !e.OK {
-		t.Fatalf("schema 10 host refused: %+v", e.Error)
+		t.Fatalf("schema 11 host refused: %+v", e.Error)
 	}
 	var resp struct {
 		SchemaVersion uint32 `json:"schema_version"`
@@ -129,9 +129,22 @@ func TestNewerHostSchemaIsAccepted(t *testing.T) {
 		t.Fatalf("answered schema %d, want %d", resp.SchemaVersion, pluginabi.SchemaVersion)
 	}
 }
+
+// A host older than the kit's schema (schema 9, CLIProxyAPI v8.0.48) is
+// refused on both register and reconfigure.
+func TestOlderHostSchemaIsRefused(t *testing.T) {
+	r := newRuntime(t, Definition{Metadata: metadata()}, nil)
+	for _, method := range []string{"plugin.register", "plugin.reconfigure"} {
+		var e pluginabi.Envelope
+		json.Unmarshal(r.Call(context.Background(), method, []byte(`{"schema_version":9}`)), &e)
+		if e.OK || e.Error == nil || e.Error.Code != "unsupported_schema" {
+			t.Fatalf("%s: schema 9 host not refused with unsupported_schema: %+v", method, e)
+		}
+	}
+}
 func TestSchemaAndMalformedRequests(t *testing.T) {
 	r := newRuntime(t, Definition{Metadata: metadata()}, nil)
-	for _, raw := range []string{`{"schema_version":8}`, `null`, `[]`, `{"schema_version":9} trailing`} {
+	for _, raw := range []string{`{"schema_version":8}`, `null`, `[]`, `{"schema_version":10} trailing`} {
 		var e pluginabi.Envelope
 		json.Unmarshal(r.Call(context.Background(), "plugin.register", []byte(raw)), &e)
 		if e.OK {
@@ -265,6 +278,10 @@ func TestAsyncStreamEmitsAndCloses(t *testing.T) {
 }
 
 type schedulerStub struct{ pluginapi.Scheduler }
+type authStub struct{ pluginapi.AuthProvider }
+type multiAuthStub struct{ pluginapi.AuthProvider }
+
+func (multiAuthStub) Identifiers() []string { return []string{"a", "b"} }
 
 func TestNewRejectsUnsafeDefinitions(t *testing.T) {
 	executor := &testExecutor{}
@@ -274,6 +291,9 @@ func TestNewRejectsUnsafeDefinitions(t *testing.T) {
 		"invalid model scope":             {Executor: executor, ExecutorInputFormats: []string{"openai"}, ExecutorOutputFormats: []string{"openai"}, ExecutorModelScope: "everything"},
 		// Advertising a capability the runtime never dispatches would leave host calls unanswered.
 		"undispatched capability": {Scheduler: schedulerStub{}},
+		// Schema 10 multi-auth registration would be silently reduced to one identifier.
+		"auth providers list": {AuthProviders: []pluginapi.AuthProvider{authStub{}}},
+		"multi auth provider": {AuthProvider: multiAuthStub{}},
 	} {
 		if _, err := New(Definition{Metadata: metadata(), Capabilities: c}, nil); err == nil {
 			t.Fatalf("%s accepted", name)
@@ -289,7 +309,7 @@ func TestNewRejectsUnsafeDefinitions(t *testing.T) {
 }
 func TestRegistrationAdvertisesOnlyConfiguredCapabilities(t *testing.T) {
 	r := newRuntime(t, Definition{Metadata: metadata(), Capabilities: pluginapi.Capabilities{Executor: &testExecutor{}, ExecutorInputFormats: []string{"openai"}, ExecutorOutputFormats: []string{"claude"}}}, nil)
-	env := rpc(t, r, "plugin.register", map[string]any{"schema_version": 9})
+	env := rpc(t, r, "plugin.register", map[string]any{"schema_version": 10})
 	if !env.OK {
 		t.Fatal(env.Error)
 	}

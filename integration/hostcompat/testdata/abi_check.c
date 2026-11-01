@@ -66,9 +66,9 @@ int main(int argc, char **argv) {
     plugin.free_buffer(NULL, 0);
 
     /* enabled: true\nupstream_url: http://127.0.0.1:1\n -- no network call. */
-    char registration[] = "{\"schema_version\":9,\"config_yaml\":\"ZW5hYmxlZDogdHJ1ZQp1cHN0cmVhbV91cmw6IGh0dHA6Ly8xMjcuMC4wLjE6MQo=\"}";
+    char registration[] = "{\"schema_version\":10,\"config_yaml\":\"ZW5hYmxlZDogdHJ1ZQp1cHN0cmVhbV91cmw6IGh0dHA6Ly8xMjcuMC4wLjE6MQo=\"}";
     CHECK(plugin.call("plugin.register", (uint8_t *)registration, strlen(registration), &response) == 0);
-    CHECK(contains(response, "\"ok\":true") && contains(response, "\"schema_version\":9"));
+    CHECK(contains(response, "\"ok\":true") && contains(response, "\"schema_version\":10"));
     plugin.free_buffer(response.ptr, response.len);
     CHECK(plugin.call("plugin.quiesce", NULL, 0, &response) == 0);
     CHECK(contains(response, "\"ok\":true"));

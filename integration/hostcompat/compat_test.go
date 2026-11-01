@@ -40,7 +40,7 @@ func (models) UnregisterClient(string)                              {}
 func (models) GetModelProviders(string) []string                    { return nil }
 
 // This is not a reimplementation of dlopen or RPC: Host.ApplyConfig invokes the
-// unmodified v8.0.48 dynamicLibraryLoader, registerRPCPlugin and real adapters.
+// unmodified v8.0.49 dynamicLibraryLoader, registerRPCPlugin and real adapters.
 func TestRealHostLoader(t *testing.T) {
 	var requests atomic.Int32
 	var streamReleased atomic.Bool

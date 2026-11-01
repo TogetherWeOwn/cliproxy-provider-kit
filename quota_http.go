@@ -18,7 +18,7 @@ const QuotaHTTPTimeout = 15 * time.Second
 
 // QuotaHTTPClient is a bounded, secret-redacting read-only polling helper.
 // It performs no logging. Errors omit URLs, headers, bodies and transport text.
-// This is deliberately separate from HostHTTPClient: ABI 1 / schema 9 has no
+// This is deliberately separate from HostHTTPClient: ABI 1 / schema 10 has no
 // no-redirect setting. Executors must always use the host client instead.
 // The transport may implement a provider's deployment proxy policy. Its RoundTrip
 // method must NOT follow redirects itself (the standard transports do not).

@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-/* ABI 1, matching CLIProxy v8.0.48 internal/pluginhost/loader_unix.go.
+/* ABI 1, matching CLIProxy v8.0.49 internal/pluginhost/loader_unix.go.
  * Buffers are allocator-owned: release plugin buffers through plugin.free_buffer,
  * and host callback buffers through host.free_buffer. Never cross the allocators.
  */

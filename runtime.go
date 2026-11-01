@@ -88,6 +88,11 @@ func New(d Definition, h Caller) (*Runtime, error) {
 	if c.FrontendAuthProvider != nil || c.Scheduler != nil || c.ModelRouter != nil || c.RequestTranslator != nil || c.RequestNormalizer != nil || c.ResponseTranslator != nil || c.ResponseBeforeTranslator != nil || c.ResponseAfterTranslator != nil || c.RequestInterceptor != nil || c.RequestBodyPatcherBefore != nil || c.RequestBodyPatcherAfter != nil || c.RequestLifecyclePlugin != nil || c.ResponseInterceptor != nil || c.StreamChunkInterceptor != nil || c.WebSocketResponseObserver != nil || c.ThinkingApplier != nil || c.CommandLinePlugin != nil || c.ManagementAPI != nil {
 		return nil, fmt.Errorf("unsupported capability in provider definition")
 	}
+	// Schema 10 multi-auth entries are not dispatched: auth.identifier answers a
+	// single identifier, so extra identifiers would be silently dropped.
+	if _, multi := c.AuthProvider.(pluginapi.MultiAuthProvider); multi || len(c.AuthProviders) > 0 {
+		return nil, fmt.Errorf("multiple auth providers are not supported; use a single AuthProvider")
+	}
 	root, cancel := context.WithCancel(context.Background())
 	return &Runtime{def: d, host: h, root: root, cancel: cancel}, nil
 }
@@ -195,7 +200,7 @@ func (r *Runtime) lifecycleCall(ctx context.Context, m string, raw []byte) (any,
 	// A newer host still accepts a plugin that answers with an older schema
 	// (it gates newer features per plugin), so only an older host is refused.
 	if req.SchemaVersion < pluginabi.SchemaVersion {
-		return nil, rpcError("unsupported_schema", "this kit requires RPC schema 9 or newer", 400)
+		return nil, rpcError("unsupported_schema", "this kit requires RPC schema 10 or newer", 400)
 	}
 	r.drain()
 	if r.def.Configure != nil {

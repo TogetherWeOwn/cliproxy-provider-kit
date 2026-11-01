@@ -2,18 +2,18 @@
 
 Shared Go building blocks for first-class [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) provider plugins. This repository is a **library**, not an installable provider or a scheduler. The echo plugin is a loopback-only example for tests.
 
-- SDK: `github.com/router-for-me/CLIProxyAPI/v8 v8.0.48`
-- Native C ABI **1**, RPC schema **9** (registers with hosts at schema 9 or newer, for example CLIProxyAPI v8.0.49 at schema 10); Go **1.26.10+**, CGO and a C compiler
+- SDK: `github.com/router-for-me/CLIProxyAPI/v8 v8.0.49`
+- Native C ABI **1**, RPC schema **10**. Minimum host: CLIProxyAPI **v8.0.49** (schema 10); newer hosts are accepted, older hosts (schema 9 or below, v8.0.48 and earlier) are refused. Go **1.26.10+**, CGO and a C compiler
 - Native libraries built with `-buildmode=c-shared`, **not** Go's `plugin` package
 - Linux is the CI-tested target. Match the deployment architecture and libc; build provider release artifacts in `golang:1.26-bookworm` for a Debian-bookworm host. The exact host/plugin Go patch versions need not match across the C ABI.
 
 ## Provider repository usage
 
-Add the kit at a reviewed commit (or a released version when available), and pin the SDK to v8.0.48. No kit release/tag is required to use a commit through Go's pseudo-version resolution.
+Add the kit at a reviewed commit (or a released version when available), and pin the SDK to v8.0.49. No kit release/tag is required to use a commit through Go's pseudo-version resolution.
 
 ```sh
 go get github.com/TogetherWeOwn/cliproxy-provider-kit@<reviewed-commit>
-go get github.com/router-for-me/CLIProxyAPI/v8@v8.0.48
+go get github.com/router-for-me/CLIProxyAPI/v8@v8.0.49
 ```
 
 Implement the SDK interfaces for your provider and pass them to `providerkit.New`. In the provider's `package main`, export a runtime factory **from `init`**. A c-shared library does not run `main`.
@@ -71,7 +71,7 @@ Use [`examples/echo/main.go`](examples/echo/main.go) for a complete executable e
 | `NewHostHTTPClient(Caller, callbackID) pluginapi.HostHTTPClient` | Scoped callback adapter, normally injected by Runtime. Never retain it beyond its request/stream. |
 | `Caller` / `CallerFunc` | Raw concurrent host callback boundary; useful for isolated contract tests. |
 
-`Definition.Capabilities` supports auth, model registration, model discovery, executor, quota and usage. Other SDK capabilities are rejected rather than advertised without handlers. Executor definitions must declare input/output formats and may set scope `both`, `static`, or `oauth` (default `both`). Let the host translate protocols to those formats; the passthrough helper does not translate or rewrite business payloads after host payload rules.
+`Definition.Capabilities` supports auth, model registration, model discovery, executor, quota and usage. Other SDK capabilities are rejected rather than advertised without handlers, including the schema 10 multi-auth forms (`Capabilities.AuthProviders`, or an `AuthProvider` implementing `MultiAuthProvider`): the kit exposes one auth identifier per plugin. Executor definitions must declare input/output formats and may set scope `both`, `static`, or `oauth` (default `both`). Let the host translate protocols to those formats; the passthrough helper does not translate or rewrite business payloads after host payload rules.
 
 ### Auth files and persistence
 
@@ -120,11 +120,11 @@ err := cache.Store(pluginapi.QuotaFetchRequest{
 
 `Store` and `FetchQuota` use `AuthID`, falling back to `AuthIndex` only when `AuthID` is absent. Supply `AuthID` whenever available in the usage record so it matches the host-enriched fetch. `Store` does not need or key on storage/metadata/attributes: the host may supply physical auth-file bytes and additional metadata only on `FetchQuota`. An older in-flight poll cannot overwrite the stored header observation. Use one cache instance for both interfaces. Invalidate an identity when reusing it for a different credential (header observations cannot detect credential changes), and recreate/invalidate the cache when configuration changes endpoint or quota semantics.
 
-**Transport distinction:** v8.0.48's `HostHTTPClient` follows redirects, without a per-request flag to prohibit them or cap reads. Therefore, the strict polling helper is separate: `QuotaHTTPClient.Do` allows GET only, uses a 15-second total timeout, never follows redirects, caps successful bodies at 1 MiB, and discards error bodies/URL/transport text. Nil uses `NewQuotaTransport()`: a clone of the standard transport that applies the `WithProxyURL` setting (else normal environment proxies) and speaks HTTP/1.1 only. Pass a configured `http.RoundTripper` when deployment proxy policy requires more; it must not follow redirects itself. The client passes it the request and context unchanged, so it honors the `WithProxyURL` setting only if it routes through `QuotaProxy` (as `NewQuotaTransport()` does); otherwise its own proxy behavior applies. An invalid `WithProxyURL` setting still fails the request with any transport. This helper is **not** for inference. If using the host client for quota instead, the host's redirect semantics apply and strict no-redirect polling is not guaranteed. Neither helper logs keys; host request logging remains controlled by the host operator.
+**Transport distinction:** v8.0.49's `HostHTTPClient` follows redirects, without a per-request flag to prohibit them or cap reads. Therefore, the strict polling helper is separate: `QuotaHTTPClient.Do` allows GET only, uses a 15-second total timeout, never follows redirects, caps successful bodies at 1 MiB, and discards error bodies/URL/transport text. Nil uses `NewQuotaTransport()`: a clone of the standard transport that applies the `WithProxyURL` setting (else normal environment proxies) and speaks HTTP/1.1 only. Pass a configured `http.RoundTripper` when deployment proxy policy requires more; it must not follow redirects itself. The client passes it the request and context unchanged, so it honors the `WithProxyURL` setting only if it routes through `QuotaProxy` (as `NewQuotaTransport()` does); otherwise its own proxy behavior applies. An invalid `WithProxyURL` setting still fails the request with any transport. This helper is **not** for inference. If using the host client for quota instead, the host's redirect semantics apply and strict no-redirect polling is not guaranteed. Neither helper logs keys; host request logging remains controlled by the host operator.
 
 ### Lifecycle and ABI ownership
 
-`plugin.register` / `plugin.reconfigure` accept a host schema of 9 or newer (an older host is refused), answer with schema 9 so the host gates newer features, and return registration metadata/capability flags. Configure gets the plugin config subtree as YAML bytes, not the whole host config. Reconfiguration first cancels and drains active work; a failed Configure leaves the runtime inactive until a successful configuration. `plugin.quiesce` stops admission and drains work. `plugin.shutdown` and the native shutdown function perform idempotent logical shutdown. Do not call lifecycle methods recursively from a capability/hook.
+`plugin.register` / `plugin.reconfigure` accept a host schema of 10 or newer (an older host is refused with `unsupported_schema`), answer with schema 10 so the host gates newer features, and return registration metadata/capability flags. Configure gets the plugin config subtree as YAML bytes, not the whole host config. Reconfiguration first cancels and drains active work; a failed Configure leaves the runtime inactive until a successful configuration. `plugin.quiesce` stops admission and drains work. `plugin.shutdown` and the native shutdown function perform idempotent logical shutdown. Do not call lifecycle methods recursively from a capability/hook.
 
 Capabilities must be concurrency-safe, immutable after construction, and cancelable. Quiesce waits for admitted work; a provider ignoring cancellation can prevent draining. Shutdown cancels streams, but does not unload a resident Go runtime. A native reinitialization uses the factory again.
 
@@ -149,13 +149,13 @@ CI runs formatting, module verification, both vet/race suites, a c-shared build,
 
 ### Why the host compatibility harness is a separate module
 
-The real loader is unexported inside `internal/pluginhost`. The test-only module at [`integration/hostcompat`](integration/hostcompat) intentionally uses import path `github.com/router-for-me/CLIProxyAPI/v8/providerkitcompat` so Go permits imports of the upstream internal host/config/registry packages. This is an internal-package testing harness, **not** a fork, an upstream package, or a replacement loader. Its module requires exactly v8.0.48 with normal Go checksum verification; there is no local `replace` or patched core source.
+The real loader is unexported inside `internal/pluginhost`. The test-only module at [`integration/hostcompat`](integration/hostcompat) intentionally uses import path `github.com/router-for-me/CLIProxyAPI/v8/providerkitcompat` so Go permits imports of the upstream internal host/config/registry packages. This is an internal-package testing harness, **not** a fork, an upstream package, or a replacement loader. Its module requires exactly v8.0.49 with normal Go checksum verification; there is no local `replace` or patched core source.
 
 `TestRealHostLoader` builds the local echo c-shared library, then calls the pinned host's `Host.ApplyConfig`: this runs the original `dynamicLibraryLoader.Open` (`dlopen/dlsym`), `registerRPCPlugin`, HTTP callbacks, streaming bridge and executor/auth/quota adapters. Assertions cover metadata/capabilities, host-merged auth persistence, quota, mock execution, incremental streaming, retry-after mapping, reconfiguration, shutdown and resident-image reinitialization. The host test process is disposable; it is not a running proxy service and opens no public listener.
 
-A second test, `TestNativeABIContract`, compiles [`testdata/abi_check.c`](integration/hostcompat/testdata/abi_check.c) with the system `cc` against [`cabi/abi.h`](cabi/abi.h) and runs it in its own process. It checks that `cliproxy_plugin_init` rejects missing tables, a wrong ABI version, a missing host `free_buffer` and a second initialization; that invalid native call arguments return `invalid_request`; that `plugin.register` works with schema 9 and `plugin.quiesce` stops admission; that shutdown is idempotent; and that the resident image can be initialized again.
+A second test, `TestNativeABIContract`, compiles [`testdata/abi_check.c`](integration/hostcompat/testdata/abi_check.c) with the system `cc` against [`cabi/abi.h`](cabi/abi.h) and runs it in its own process. It checks that `cliproxy_plugin_init` rejects missing tables, a wrong ABI version, a missing host `free_buffer` and a second initialization; that invalid native call arguments return `invalid_request`; that `plugin.register` works with schema 10 and `plugin.quiesce` stops admission; that shutdown is idempotent; and that the resident image can be initialized again.
 
-Source contracts pinned to [v8.0.48](https://github.com/router-for-me/CLIProxyAPI/tree/v8.0.48):
+Source contracts pinned to [v8.0.49](https://github.com/router-for-me/CLIProxyAPI/tree/v8.0.49):
 
 - `sdk/pluginabi/types.go`: ABI/schema constants, method names, envelope/error contract.
 - `sdk/pluginapi/types.go`: auth/model/executor/host HTTP/quota/usage interfaces.
@@ -167,6 +167,6 @@ Source contracts pinned to [v8.0.48](https://github.com/router-for-me/CLIProxyAP
 
 ## Provider releases (not kit releases)
 
-This library has no installable `.so`, `registry.json`, migration command, or plugin-store entry of its own. Provider repositories own those artifacts and credential migration. For the v8.0.48 GitHub store contract, release `<plugin-id>_<version>_linux_amd64.zip` with `<plugin-id>.so` and checksums, and publish a schema-1 `registry.json` with the provider's GitHub-release installation metadata. Verify the exact contract in `internal/pluginstore/github.go` before releasing a provider. Keep all credentials out of artifacts and fixtures. Stage each provider before any production cutover; native compatibility executors may take precedence over plugin executors.
+This library has no installable `.so`, `registry.json`, migration command, or plugin-store entry of its own. Provider repositories own those artifacts and credential migration. For the v8.0.49 GitHub store contract, release `<plugin-id>_<version>_linux_amd64.zip` with `<plugin-id>.so` and checksums, and publish a schema-1 `registry.json` with the provider's GitHub-release installation metadata. Verify the exact contract in `internal/pluginstore/github.go` before releasing a provider. Keep all credentials out of artifacts and fixtures. Stage each provider before any production cutover; native compatibility executors may take precedence over plugin executors.
 
 The C ABI layout is adapted from CLIProxyAPI's MIT-licensed simple Go plugin example and loader. The original copyright notices are retained in [LICENSE](LICENSE), alongside this kit's MIT license.
