@@ -99,6 +99,12 @@ type APIKeyLoginField struct {
 	Description string
 	// Required rejects submissions that omit the field.
 	Required bool
+	// Secret reads the value with hidden terminal input (read -rs), like
+	// the main API key, instead of the plain read -r used for visible
+	// fields. Set it for extra keys and tokens (e.g. a separate quota or
+	// analytics key) so they never echo while typed. Secret values are
+	// also scrubbed from provider error messages, like the API key.
+	Secret bool
 }
 
 // APIKeyLoginConfig wires provider behavior into the login helper.
@@ -434,6 +440,22 @@ func loginEscapeLine(varName, escName string) string {
 		escName + "=${" + escName + "//$'\\t'/\\\\t}"
 }
 
+// loginScrubSecret removes a secret and its URL-encoded and JSON-escaped
+// forms from an operator-facing message. Blank secrets scrub nothing.
+func loginScrubSecret(message, secret string) string {
+	if secret == "" {
+		return message
+	}
+	message = strings.ReplaceAll(message, secret, "[redacted]")
+	if enc := url.QueryEscape(secret); enc != secret {
+		message = strings.ReplaceAll(message, enc, "[redacted]")
+	}
+	if esc := loginJSONString(secret); esc != secret {
+		message = strings.ReplaceAll(message, esc, "[redacted]")
+	}
+	return message
+}
+
 // loginJSONString escapes a server-side string (a declared field name) for
 // embedding in the page's JSON body template.
 func loginJSONString(s string) string {
@@ -449,8 +471,9 @@ func loginJSONString(s string) string {
 // read -rs would eat the next pasted line as its input and the operator's
 // real key would then run as a command, landing in history and on stderr.
 // The block is written for bash and zsh (prompt via printf, hidden raw input
-// via read -rs, plain raw input via read -r: raw mode keeps backslashes in
-// keys intact, and -p is avoided because zsh gives it another meaning). Both
+// via read -rs for the keys and Secret fields, plain raw input via read -r
+// for visible fields: raw mode keeps backslashes in keys intact, and -p is
+// avoided because zsh gives it another meaning). Both
 // secrets travel over stdin — the bearer header in a process-substitution
 // file, the JSON body in a heredoc — so neither appears in process arguments,
 // shell history, a URL, or a log line.
@@ -502,7 +525,11 @@ func (l *APIKeyLogin) servePage(req pluginapi.ManagementRequest) pluginapi.Manag
 			} else {
 				prompt += " (optional)"
 			}
-			cmd.WriteString("printf '" + loginShellSingle(prompt) + ": '; read -r " + loginShellVar(f.Name) + "; echo\n")
+			readFlags := "read -r "
+			if f.Secret {
+				readFlags = "read -rs "
+			}
+			cmd.WriteString("printf '" + loginShellSingle(prompt) + ": '; " + readFlags + loginShellVar(f.Name) + "; echo\n")
 		}
 		// Header values must not span lines: strip CR/LF from the management
 		// key with builtins before it reaches the header file. The header
@@ -639,18 +666,17 @@ func (l *APIKeyLogin) serveSubmit(ctx context.Context, req pluginapi.ManagementR
 		if status < 400 || status > 599 {
 			status = http.StatusBadRequest
 		}
-		message := mapped.Message
-		if key != "" {
-			message = strings.ReplaceAll(message, key, "[redacted]")
-			// Providers may echo the key URL-encoded or JSON-escaped; scrub
-			// those recoverable forms too. The recipient already holds the
-			// key (they just typed it), so this keeps key material out of
-			// host and middleware response logs.
-			if enc := url.QueryEscape(key); enc != key {
-				message = strings.ReplaceAll(message, enc, "[redacted]")
+		// Providers may echo a secret URL-encoded or JSON-escaped; scrub
+		// those recoverable forms too. The recipient already holds the
+		// secrets (they just typed them), so this keeps key material out
+		// of host and middleware response logs.
+		message := loginScrubSecret(mapped.Message, key)
+		for _, f := range l.fields {
+			if !f.Secret {
+				continue
 			}
-			if esc := loginJSONString(key); esc != key {
-				message = strings.ReplaceAll(message, esc, "[redacted]")
+			if v, ok := candidate[f.Name].(string); ok {
+				message = loginScrubSecret(message, v)
 			}
 		}
 		return loginJSONError(status, mapped.Code, message)

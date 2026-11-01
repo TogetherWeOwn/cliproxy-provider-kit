@@ -728,6 +728,69 @@ func TestLoginPageIncludesRequiredFields(t *testing.T) {
 	}
 }
 
+// TestLoginPageHidesSecretFields pins hidden input (read -rs) for both the
+// main API key and extra Secret fields, while visible fields keep the plain
+// read -r so operators can see what they type.
+func TestLoginPageHidesSecretFields(t *testing.T) {
+	echoAuth := APIKeyAuth{Provider: "echo"}
+	login, err := NewAPIKeyLogin(APIKeyLoginConfig{Provider: "echo", Parse: echoAuth.ParseAuth,
+		Fields: []APIKeyLoginField{
+			{Name: "account_id", Label: "Account ID", Required: true},
+			{Name: "quota_api_key", Label: "Quota API key", Secret: true},
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := loginRuntime(t, login)
+	start := startLogin(t, r)
+	page := manage(t, r, pluginapi.ManagementRequest{Method: "GET", Path: loginResourceBase + "/login",
+		Query: map[string][]string{"state": {start.State}}})
+	if page.StatusCode != 200 {
+		t.Fatalf("page %+v", page)
+	}
+	// The command is HTML-escaped inside <pre>: check the pasted text.
+	body := html.UnescapeString(string(page.Body))
+	for _, want := range []string{
+		"read -rs PLUGIN_API_KEY; echo",
+		"read -rs PLUGIN_FIELD_QUOTA_API_KEY; echo",
+		"read -r PLUGIN_FIELD_ACCOUNT_ID; echo",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("page missing hidden/visible input %q: %s", want, body)
+		}
+	}
+	if strings.Contains(body, "read -r PLUGIN_FIELD_QUOTA_API_KEY") {
+		t.Fatalf("secret field read with echoing input: %s", body)
+	}
+}
+
+// TestLoginScrubsSecretFieldEchoes proves a leaky provider error cannot echo
+// a Secret field value back to the operator (and into host logs), while a
+// visible field value is left alone.
+func TestLoginScrubsSecretFieldEchoes(t *testing.T) {
+	leaky := func(_ context.Context, _ pluginapi.AuthParseRequest) (pluginapi.AuthParseResponse, error) {
+		return pluginapi.AuthParseResponse{}, &pluginabi.Error{Code: "upstream_says_no",
+			Message: "upstream rejected quota-secret-value for account ac-1", HTTPStatus: 400}
+	}
+	login, err := NewAPIKeyLogin(APIKeyLoginConfig{Provider: "echo", Parse: leaky,
+		Fields: []APIKeyLoginField{
+			{Name: "account_id", Label: "Account ID", Required: true},
+			{Name: "quota_api_key", Label: "Quota API key", Secret: true},
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := loginRuntime(t, login)
+	start := startLogin(t, r)
+	resp := manage(t, r, pluginapi.ManagementRequest{Method: "POST", Path: loginSubmitPath,
+		Body: []byte(`{"state":"` + start.State + `","api_key":"example-key","account_id":"ac-1","quota_api_key":"quota-secret-value"}`)})
+	body := string(resp.Body)
+	if resp.StatusCode != 400 || strings.Contains(body, "quota-secret-value") ||
+		!strings.Contains(body, "[redacted]") || !strings.Contains(body, "ac-1") {
+		t.Fatalf("secret field scrub %+v", resp)
+	}
+}
+
 func TestLoginResubmitAfterConsumedIsRejected(t *testing.T) {
 	r := loginRuntime(t, echoLogin(t))
 	start := startLogin(t, r)
@@ -761,7 +824,10 @@ func TestLoginPageBlockSurvivesLineByLinePaste(t *testing.T) {
 	}
 	echoAuth := APIKeyAuth{Provider: "echo"}
 	login, err := NewAPIKeyLogin(APIKeyLoginConfig{Provider: "echo", Parse: echoAuth.ParseAuth,
-		Fields: []APIKeyLoginField{{Name: "account_id", Label: "Account ID", Required: true}}})
+		Fields: []APIKeyLoginField{
+			{Name: "account_id", Label: "Account ID", Required: true},
+			{Name: "quota_api_key", Label: "Quota API key", Secret: true},
+		}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -787,6 +853,7 @@ func TestLoginPageBlockSurvivesLineByLinePaste(t *testing.T) {
 	mgmtKey := "mgmt-test-key"
 	apiKey := "ab\"cd\\ef$HOME`tick`\tplain"
 	account := "ac-1"
+	quotaKey := "qu\"ota\\key"
 	var gotPath, gotAuth, gotBody string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		gotPath, gotAuth = req.URL.Path, req.Header.Get("Authorization")
@@ -802,7 +869,7 @@ func TestLoginPageBlockSurvivesLineByLinePaste(t *testing.T) {
 	// before any read runs, so the reads consume the secrets that follow.
 	cmd := exec.Command("bash")
 	cmd.Env = append(os.Environ(), "CLIPROXY_BASE="+srv.URL)
-	cmd.Stdin = strings.NewReader(block + mgmtKey + "\n" + apiKey + "\n" + account + "\n")
+	cmd.Stdin = strings.NewReader(block + mgmtKey + "\n" + apiKey + "\n" + account + "\n" + quotaKey + "\n")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("pasted block failed: %v\n%s", err, out)
@@ -817,7 +884,7 @@ func TestLoginPageBlockSurvivesLineByLinePaste(t *testing.T) {
 	if err := json.Unmarshal([]byte(gotBody), &decoded); err != nil {
 		t.Fatalf("body is not valid JSON %q: %v\n%s", gotBody, err, out)
 	}
-	if decoded["state"] != start.State || decoded["api_key"] != apiKey || decoded["account_id"] != account {
+	if decoded["state"] != start.State || decoded["api_key"] != apiKey || decoded["account_id"] != account || decoded["quota_api_key"] != quotaKey {
 		t.Fatalf("secrets mangled: %s", gotBody)
 	}
 }
