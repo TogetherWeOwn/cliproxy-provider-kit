@@ -76,15 +76,16 @@ func TestLoginConfigValidation(t *testing.T) {
 	echoAuth := APIKeyAuth{Provider: "echo"}
 	parse := echoAuth.ParseAuth
 	for name, cfg := range map[string]APIKeyLoginConfig{
-		"blank provider":  {Provider: " ", Parse: parse},
-		"path traversal":  {Provider: "a/../b", Parse: parse},
-		"slash":           {Provider: "a/b", Parse: parse},
-		"nil parse":       {Provider: "echo"},
-		"blank field":     {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{}}},
-		"reserved field":  {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "api_key"}}},
-		"duplicate field": {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "x"}, {Name: "x"}}},
-		"reserved id":     {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "id"}}},
-		"shell collision": {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "a-b"}, {Name: "a_b"}}},
+		"blank provider":     {Provider: " ", Parse: parse},
+		"path traversal":     {Provider: "a/../b", Parse: parse},
+		"slash":              {Provider: "a/b", Parse: parse},
+		"nil parse":          {Provider: "echo"},
+		"blank field":        {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{}}},
+		"reserved field":     {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "api_key"}}},
+		"host-managed field": {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "weight"}}},
+		"duplicate field":    {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "x"}, {Name: "x"}}},
+		"reserved id":        {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "id"}}},
+		"shell collision":    {Provider: "echo", Parse: parse, Fields: []APIKeyLoginField{{Name: "a-b"}, {Name: "a_b"}}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := NewAPIKeyLogin(cfg); err == nil {

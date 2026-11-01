@@ -155,6 +155,12 @@ func NewAPIKeyLogin(cfg APIKeyLoginConfig) (*APIKeyLogin, error) {
 		switch name {
 		case "type", "id", "state", "api_key", "label":
 			return nil, rpcError("invalid_login", "login field name is reserved", 500)
+		case "weight", "priority", "disabled":
+			// The page submits every field answer as a JSON string, but
+			// ParseAuth requires integers for weight/priority and a
+			// boolean for disabled, so declaring one could never submit
+			// successfully. Reserve them to fail fast at config time.
+			return nil, rpcError("invalid_login", "login field name is reserved", 500)
 		}
 		if _, dup := byName[name]; dup {
 			return nil, rpcError("invalid_login", "duplicate login field name", 500)
