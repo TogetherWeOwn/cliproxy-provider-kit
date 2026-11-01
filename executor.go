@@ -12,6 +12,8 @@ import (
 // Passthrough is a thin executor. BuildRequest selects the provider protocol,
 // endpoint and authentication; it must preserve the host's final business payload
 // (the host already applied payload rules). No protocol translation is done here.
+// ExecuteStream re-frames the raw upstream SSE bytes into one host chunk per
+// data event (see frameStreamChunks); callers must not frame again.
 // HttpRequest copies the supplied HTTP request unless PrepareHTTP is provided.
 // Every network operation uses the injected HostHTTPClient; there is no fallback.
 // Provider-specific quota/exhaustion classification belongs in ClassifyError.
@@ -98,9 +100,13 @@ func (p Passthrough) ExecuteStream(ctx context.Context, r pluginapi.ExecutorRequ
 			}
 		}
 	}
-	out := make(chan pluginapi.ExecutorStreamChunk)
+	// The host consumes one SSE event per stream chunk; re-frame the raw
+	// upstream bytes here so every Passthrough caller speaks the host's chunk
+	// contract (bare JSON for OpenAI chat/completions clients, one
+	// "data:"-framed event per chunk otherwise). See frameStreamChunks.
+	raw := make(chan pluginapi.ExecutorStreamChunk)
 	go func() {
-		defer close(out)
+		defer close(raw)
 		defer cancel()
 		for {
 			select {
@@ -111,7 +117,7 @@ func (p Passthrough) ExecuteStream(ctx context.Context, r pluginapi.ExecutorRequ
 					return
 				}
 				select {
-				case out <- pluginapi.ExecutorStreamChunk{Payload: chunk.Payload, Err: chunk.Err}:
+				case raw <- pluginapi.ExecutorStreamChunk{Payload: chunk.Payload, Err: chunk.Err}:
 				case <-streamCtx.Done():
 					return
 				}
@@ -121,7 +127,7 @@ func (p Passthrough) ExecuteStream(ctx context.Context, r pluginapi.ExecutorRequ
 			}
 		}
 	}()
-	return pluginapi.ExecutorStreamResponse{Headers: resp.Headers, Chunks: out}, nil
+	return pluginapi.ExecutorStreamResponse{Headers: resp.Headers, Chunks: frameStreamChunks(ctx, raw, clientWantsBareJSON(r))}, nil
 }
 
 // CountTokens uses TokenCount when supplied. Otherwise it returns an explicitly

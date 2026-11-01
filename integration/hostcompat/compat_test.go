@@ -184,13 +184,17 @@ func TestRealHostLoader(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var streamed strings.Builder
+	// The kit re-frames upstream SSE into one host chunk per data event:
+	// with no inbound route recorded the chunks keep their "data:" framing,
+	// and the upstream [DONE] is dropped (the handlers append their own
+	// terminator at the HTTP layer).
+	var chunks []string
 	select {
 	case first, ok := <-stream.Chunks:
 		if !ok || first.Err != nil || len(first.Payload) == 0 {
 			t.Fatalf("missing initial chunk: %+v", first)
 		}
-		streamed.Write(first.Payload)
+		chunks = append(chunks, string(first.Payload))
 		if streamReleased.Load() {
 			t.Fatal("upstream finished before initial chunk was observed")
 		}
@@ -202,10 +206,16 @@ func TestRealHostLoader(t *testing.T) {
 		if chunk.Err != nil {
 			t.Fatal(chunk.Err)
 		}
-		streamed.Write(chunk.Payload)
+		chunks = append(chunks, string(chunk.Payload))
 	}
-	if !strings.Contains(streamed.String(), "[DONE]") || !strings.Contains(streamed.String(), "hello") || !streamReleased.Load() {
-		t.Fatalf("incomplete stream %s", streamed.String())
+	streamed := strings.Join(chunks, "")
+	if len(chunks) != 42 || strings.Contains(streamed, "[DONE]") || !strings.Contains(streamed, "hello") || !streamReleased.Load() {
+		t.Fatalf("incomplete stream %d chunks %s", len(chunks), streamed)
+	}
+	for _, c := range chunks {
+		if !strings.HasPrefix(c, "data: ") || strings.Contains(c, "\n") {
+			t.Fatalf("chunk is not one data-framed event %q", c)
+		}
 	}
 	limited := req
 	limited.Payload = []byte(`{"model":"echo-model","error":true}`)

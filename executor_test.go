@@ -71,7 +71,9 @@ func TestPassthroughErrorMapper(t *testing.T) {
 	}
 }
 func TestPassthroughStreamAndHTTP(t *testing.T) {
-	h := &localHostHTTP{status: 200, chunks: []pluginapi.HTTPStreamChunk{{Payload: []byte("one")}, {Payload: []byte("two")}, {Err: errors.New("broken")}}}
+	// ExecuteStream re-frames upstream SSE: one data-framed chunk per event
+	// here (no request_path metadata), and the terminal error still arrives.
+	h := &localHostHTTP{status: 200, chunks: []pluginapi.HTTPStreamChunk{{Payload: []byte("data: one\n\n")}, {Payload: []byte("data: two")}, {Payload: []byte("\n\n"), Err: errors.New("broken")}}}
 	p := echoExecutor()
 	resp, err := p.ExecuteStream(context.Background(), pluginapi.ExecutorRequest{HTTPClient: h})
 	if err != nil {
@@ -83,7 +85,7 @@ func TestPassthroughStreamAndHTTP(t *testing.T) {
 		text += string(c.Payload)
 		streamErr = c.Err
 	}
-	if text != "onetwo" || streamErr == nil {
+	if text != "data: onedata: two" || streamErr == nil {
 		t.Fatalf("stream %q %v", text, streamErr)
 	}
 	h.body = []byte("http")
@@ -240,8 +242,10 @@ func TestPassthroughStreamReleasesHostOperation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	upstream <- pluginapi.HTTPStreamChunk{Payload: []byte("one")}
-	if c := <-resp.Chunks; string(c.Payload) != "one" {
+	// ExecuteStream re-frames upstream SSE, so the fixture speaks SSE: one
+	// data-framed chunk per event without a request_path signal.
+	upstream <- pluginapi.HTTPStreamChunk{Payload: []byte("data: one\n\n")}
+	if c := <-resp.Chunks; string(c.Payload) != "data: one" {
 		t.Fatalf("chunk %+v", c)
 	}
 	// The consumer goes away while upstream is idle: the stream must end and cancel the host operation.
@@ -262,7 +266,7 @@ func TestPassthroughStreamReleasesHostOperation(t *testing.T) {
 
 	// Normal completion must also release the host-side operation.
 	upstream = make(chan pluginapi.HTTPStreamChunk, 1)
-	upstream <- pluginapi.HTTPStreamChunk{Payload: []byte("done")}
+	upstream <- pluginapi.HTTPStreamChunk{Payload: []byte("data: done\n\n")}
 	close(upstream)
 	resp, err = echoExecutor().ExecuteStream(context.Background(), pluginapi.ExecutorRequest{HTTPClient: h})
 	if err != nil {

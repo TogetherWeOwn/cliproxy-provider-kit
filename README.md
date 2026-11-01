@@ -97,7 +97,7 @@ own.
 | `CheckModelNamespace(ns, models) error` / `AssertModelNamespace(t, ns, models)` | Reusable conformance check for plugin test suites: every emitted id must carry `ns` exactly once. |
 | `APIKeyAuth` | Stateless SDK `AuthProvider`; top-level type dispatch, validation, stable IDs, API-key-only login errors, no-op refresh. Optional `Validate` checks provider fields. |
 | `AuthFields(storage, metadata)` / `APIKey(storage, metadata)` | Decode object storage with host-compatible metadata precedence; never include credential values in errors. |
-| `Passthrough` | SDK executor using **only** the injected `HostHTTPClient`. Supply `BuildRequest`; optionally `PrepareHTTP`, `ClassifyError`, and `TokenCount`. |
+| `Passthrough` | SDK executor using **only** the injected `HostHTTPClient`. Supply `BuildRequest`; optionally `PrepareHTTP`, `ClassifyError`, and `TokenCount`. `ExecuteStream` re-frames upstream SSE into one host chunk per data event (comments/`[DONE]` dropped); callers must not frame again. |
 | `MapError(error) *pluginabi.Error` | Preserve explicit code/status/retry fields; redact unclassified errors. |
 | `RetryAfterSeconds(header, now) int` | Parse HTTP seconds/date retry guidance without a hidden clock. |
 | `NewCachedQuota(provider, display, FetchQuotaFunc) *CachedQuota` | Non-resettable SDK `QuotaProvider`; successful per-auth cache for `QuotaCacheTTL` = 60 seconds, coalesced concurrent fetches, copy isolation. |
@@ -126,6 +126,8 @@ Storage remains a JSON **object** with provider fields; host-owned id/label/pref
 `BuildRequest` must choose a trusted endpoint and add the provider's auth headers. Preserve the final `ExecutorRequest.Payload`; CLIProxy has already applied its payload policy. `PrepareHTTP` can inject auth and restrict the URL for SDK `HttpRequest`; without it that method forwards the supplied HTTP request unchanged. Do not copy client credentials blindly into upstream headers. The kit never constructs an independent executor transport.
 
 `ExecuteStream` opens HTTP through `host.http.do_stream`, reads raw chunks incrementally, and returns headers before completion. Runtime forwards chunks asynchronously with `host.stream.emit` and exactly one `host.stream.close`. It does not buffer the entire stream. Upstream setup failures return a normal RPC error; late stream failures carry structured `error_detail`. Host operation IDs propagate cancellation to blocked HTTP setup/read calls. Providers must honor contexts, and consumers must drain a stream or cancel its context.
+
+`ExecuteStream` re-frames the raw upstream SSE bytes into exactly one host chunk per data event before returning: events split on blank lines, `:` comments and `[DONE]` dropped, one chunk per event — the bare JSON payload for OpenAI chat/completions clients (the host records the inbound route in the request metadata's `request_path`; without it the chunk stays `data:`-framed, the host's documented chunk form). Pass-through plugins must not frame again: raw upstream reads wrapped in a second `data:` prefix produced `data: data:` frames and duplicate `[DONE]` on `/v1/chat/completions` and lost tokens on `/v1/messages`. A truncated frame cut short by an upstream error is dropped while the error still propagates; an event over 8 MiB, or a multi-line event that is not one JSON value, ends the stream with an `invalid_stream` error.
 
 Classify provider errors explicitly, including exhaustion versus transient throttling, using **safe public text**:
 
