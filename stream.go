@@ -18,8 +18,9 @@ const maxStreamEventBytes = 8 << 20
 
 // The host consumes one SSE event per stream chunk, but an upstream's raw
 // bytes can carry several events, comments and [DONE] in one read.
-// frameStreamChunks re-frames the upstream stream into exactly one chunk per
-// data event:
+// frameStreamChunks re-frames an OpenAI-protocol SSE stream into exactly one
+// chunk per data event (line endings CR, LF or CRLF, including a CRLF split
+// across upstream reads):
 //
 //   - When the client speaks OpenAI chat, the host skips translation for this
 //     same-format plugin stream and the OpenAI handler writes each chunk as
@@ -49,9 +50,8 @@ func frameStreamChunks(ctx context.Context, in <-chan pluginapi.ExecutorStreamCh
 		if onExit != nil {
 			defer onExit()
 		}
-		var line []byte   // the current, incomplete line
-		var data []string // data lines of the current event
-		size := 0         // bytes held in data
+		var line []byte  // the current, incomplete line
+		var event []byte // data lines of the current event, each terminated by '\n'
 		send := func(c pluginapi.ExecutorStreamChunk) error {
 			select {
 			case out <- c:
@@ -61,11 +61,11 @@ func frameStreamChunks(ctx context.Context, in <-chan pluginapi.ExecutorStreamCh
 			}
 		}
 		dispatch := func() error {
-			if len(data) == 0 {
+			if len(event) == 0 {
 				return nil
 			}
-			payload := strings.Join(data, "\n")
-			data, size = data[:0], 0
+			payload := string(event[:len(event)-1])
+			event = event[:0]
 			if strings.TrimSpace(payload) == "[DONE]" {
 				return nil
 			}
@@ -96,11 +96,13 @@ func frameStreamChunks(ctx context.Context, in <-chan pluginapi.ExecutorStreamCh
 				if len(v) > 0 && v[0] == ' ' {
 					v = v[1:]
 				}
-				if size+len(v) > maxStreamEventBytes {
+				// Count the separator too: every data line advances the
+				// bound, so an event of many empty lines still trips it.
+				if len(event)+len(v)+1 > maxStreamEventBytes {
 					return errStreamEventTooLarge
 				}
-				data = append(data, string(v))
-				size += len(v)
+				event = append(event, v...)
+				event = append(event, '\n')
 			}
 			// Other fields (event, id, retry) carry nothing the host reads.
 			return nil
@@ -121,18 +123,30 @@ func frameStreamChunks(ctx context.Context, in <-chan pluginapi.ExecutorStreamCh
 						return dispatch()
 					}
 					buf := append(line, c.Payload...)
-					for {
-						i := bytes.IndexByte(buf, '\n')
+					for len(buf) > 0 {
+						i := bytes.IndexAny(buf, "\r\n")
 						if i < 0 {
 							break
+						}
+						next := i + 1
+						if buf[i] == '\r' {
+							if i+1 >= len(buf) {
+								// A trailing CR may be a CRLF split
+								// across reads; hold it for more
+								// input or EOF.
+								break
+							}
+							if buf[i+1] == '\n' {
+								next = i + 2
+							}
 						}
 						if err := field(buf[:i]); err != nil {
 							return err
 						}
-						buf = buf[i+1:]
+						buf = buf[next:]
 					}
 					line = append(line[:0:0], buf...)
-					if len(line)+size > maxStreamEventBytes {
+					if len(line)+len(event) > maxStreamEventBytes {
 						return errStreamEventTooLarge
 					}
 					if c.Err != nil {
@@ -157,14 +171,28 @@ func invalidStreamChunk(msg string) *pluginabi.Error {
 	return rpcError("invalid_stream", msg, http.StatusBadGateway)
 }
 
+// openAIOutputFormat reports whether the plugin speaks the OpenAI protocol
+// for this call. The host sets Format to the plugin's own declared output
+// format ("openai", see sdk/translator FormatOpenAI); an empty format keeps
+// the historical OpenAI assumption for direct callers. Translators and
+// native host paths consume framed SSE, so only OpenAI output is re-framed.
+//
 // clientWantsBareJSON reports a client on an OpenAI chat or completions
-// route, the only case in which the host passes this plugin's stream through
-// untranslated. The plugin cannot read the client format from the request:
+// route served by an OpenAI-output plugin, the only case in which the host
+// passes this plugin's stream through untranslated and writes each chunk
+// itself as "data: %s". The plugin cannot read the client format from the request:
 // the host sets SourceFormat and Format to the plugin's own declared format
 // whatever the client speaks, so the inbound route the host records in the
 // request metadata is the reliable signal. Without it the chunk stays
 // "data:"-framed, the host's documented chunk form.
+func openAIOutputFormat(r pluginapi.ExecutorRequest) bool {
+	return r.Format == "" || r.Format == "openai"
+}
+
 func clientWantsBareJSON(r pluginapi.ExecutorRequest) bool {
+	if !openAIOutputFormat(r) {
+		return false
+	}
 	path, _ := r.Metadata["request_path"].(string)
 	path = strings.TrimRight(strings.TrimSpace(path), "/")
 	return strings.HasSuffix(path, "/chat/completions") || strings.HasSuffix(path, "/v1/completions")

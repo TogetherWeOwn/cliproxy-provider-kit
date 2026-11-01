@@ -112,21 +112,55 @@ func TestFrameStreamChunksStopsOnCancel(t *testing.T) {
 }
 
 func TestClientWantsBareJSON(t *testing.T) {
-	for path, want := range map[string]bool{
-		"/v1/chat/completions":   true,
-		"/v1/completions":        true,
-		"/v1/messages":           false,
-		"/v1/responses":          false,
-		"/v1beta/models/*action": false,
-		"":                       false,
+	for _, tc := range []struct {
+		format string
+		path   string
+		want   bool
+	}{
+		{"openai", "/v1/chat/completions", true},
+		{"", "/v1/chat/completions", true},
+		{"openai", "/v1/completions", true},
+		{"openai", "/v1/messages", false},
+		{"openai", "/v1/responses", false},
+		{"openai", "/v1beta/models/*action", false},
+		{"openai", "", false},
+		// Only OpenAI output is ever re-framed: translators and native
+		// host paths consume framed SSE with event names.
+		{"claude", "/v1/chat/completions", false},
+		{"claude", "/v1/messages", false},
+		{"openai-response", "/v1/chat/completions", false},
 	} {
 		md := map[string]any{}
-		if path != "" {
-			md["request_path"] = path
+		if tc.path != "" {
+			md["request_path"] = tc.path
 		}
-		if got := clientWantsBareJSON(pluginapi.ExecutorRequest{Metadata: md}); got != want {
-			t.Fatalf("%q: %v", path, got)
+		r := pluginapi.ExecutorRequest{Format: tc.format, Metadata: md}
+		if got := clientWantsBareJSON(r); got != tc.want {
+			t.Fatalf("%q %q: %v", tc.format, tc.path, got)
 		}
+	}
+}
+
+func TestFrameStreamChunksCRLineEndings(t *testing.T) {
+	// Standalone CR is a valid SSE line ending, including a CRLF split
+	// across upstream reads: a trailing CR waits for the next byte.
+	got, errs := collectStream(t, frameStreamChunks(context.Background(), streamFeed(streamBytes("data: {\"a\":1}\r\rdata: {\"b\":2}\r\r")), false, nil))
+	if !reflect.DeepEqual(got, []string{`data: {"a":1}`, `data: {"b":2}`}) || len(errs) != 0 {
+		t.Fatalf("CR-only: got %q errs %v", got, errs)
+	}
+	got, errs = collectStream(t, frameStreamChunks(context.Background(), streamFeed(streamBytes("data: {\"a\":1}\r"), streamBytes("\n\r\ndata: {\"b\":2}\r\n\r\n")), false, nil))
+	if !reflect.DeepEqual(got, []string{`data: {"a":1}`, `data: {"b":2}`}) || len(errs) != 0 {
+		t.Fatalf("split CRLF: got %q errs %v", got, errs)
+	}
+}
+
+func TestFrameStreamChunksBoundsEmptyLines(t *testing.T) {
+	// Every data line advances the event bound, even empty ones: an event
+	// of blank data lines with no terminator must still trip it.
+	lines := bytes.Repeat([]byte("data:\n"), (8<<20)+2)
+	_, errs := collectStream(t, frameStreamChunks(context.Background(), streamFeed(streamBytes(string(lines))), false, nil))
+	if len(errs) != 1 || streamRPC(t, errs[0]).Code != "invalid_stream" {
+		t.Fatalf("errs %v", errs)
 	}
 }
 

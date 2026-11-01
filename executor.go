@@ -14,9 +14,11 @@ import (
 // Passthrough is a thin executor. BuildRequest selects the provider protocol,
 // endpoint and authentication; it must preserve the host's final business payload
 // (the host already applied payload rules). No protocol translation is done here.
-// ExecuteStream re-frames SSE upstream bytes into one host chunk per data
-// event (see frameStreamChunks) and forwards other wire formats unchanged;
-// callers must not frame again.
+// ExecuteStream re-frames OpenAI-protocol SSE upstream bytes into one host
+// chunk per data event (see frameStreamChunks) and forwards anything else
+// unchanged: other Content-Types so the host frames them, and non-OpenAI
+// plugin output so translators and native host paths keep complete framed
+// SSE with event names. Callers must not frame again.
 // HttpRequest copies the supplied HTTP request unless PrepareHTTP is provided.
 // Every network operation uses the injected HostHTTPClient; there is no fallback.
 // Provider-specific quota/exhaustion classification belongs in ClassifyError.
@@ -103,12 +105,14 @@ func (p Passthrough) ExecuteStream(ctx context.Context, r pluginapi.ExecutorRequ
 			}
 		}
 	}
-	// The host consumes one SSE event per stream chunk; re-frame SSE
-	// upstream bytes here so every Passthrough caller speaks the host's chunk
+	// The host consumes one SSE event per stream chunk; re-frame
+	// OpenAI-protocol SSE here so those callers speak the host's chunk
 	// contract (bare JSON for OpenAI chat/completions clients, one
 	// "data:"-framed event per chunk otherwise). See frameStreamChunks.
-	// Upstreams that do not speak SSE (a Content-Type other than
-	// text/event-stream) are forwarded unchanged so the host frames them.
+	// Anything else goes through byte-identical: upstreams that do not
+	// speak SSE (a Content-Type other than text/event-stream) so the host
+	// frames them, and non-OpenAI plugin output so translators and native
+	// host paths keep complete SSE framing with event names.
 	raw := make(chan pluginapi.ExecutorStreamChunk)
 	go func() {
 		defer close(raw)
@@ -132,7 +136,7 @@ func (p Passthrough) ExecuteStream(ctx context.Context, r pluginapi.ExecutorRequ
 			}
 		}
 	}()
-	if !isSSEStream(resp.Headers) {
+	if !isSSEStream(resp.Headers) || !openAIOutputFormat(r) {
 		return pluginapi.ExecutorStreamResponse{Headers: resp.Headers, Chunks: raw}, nil
 	}
 	// If framing fails the parser stops reading while the forwarder may still

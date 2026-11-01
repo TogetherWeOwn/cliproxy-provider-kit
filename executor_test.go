@@ -302,3 +302,25 @@ func TestPassthroughNonSSEPassesThrough(t *testing.T) {
 		t.Fatalf("got %q want %q", got, raw)
 	}
 }
+
+// A non-OpenAI plugin output is forwarded byte-identical even on a chat
+// route: translators and native host paths need complete framed SSE.
+func TestPassthroughNonOpenAIOutputForwardsRaw(t *testing.T) {
+	raw := "event: content_block_delta\ndata: {\"a\":1}\n\n"
+	h := &localHostHTTP{status: 200, headers: http.Header{"Content-Type": {"text/event-stream"}}, chunks: []pluginapi.HTTPStreamChunk{{Payload: []byte(raw)}}}
+	p := echoExecutor()
+	resp, err := p.ExecuteStream(context.Background(), pluginapi.ExecutorRequest{Format: "claude", Metadata: map[string]any{"request_path": "/v1/chat/completions"}, HTTPClient: h})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []byte
+	for c := range resp.Chunks {
+		if c.Err != nil {
+			t.Fatal(c.Err)
+		}
+		got = append(got, c.Payload...)
+	}
+	if string(got) != raw {
+		t.Fatalf("got %q want %q", got, raw)
+	}
+}
