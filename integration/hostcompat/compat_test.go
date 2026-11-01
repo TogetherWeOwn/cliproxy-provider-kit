@@ -165,8 +165,8 @@ func TestRealHostLoader(t *testing.T) {
 	if !ok {
 		t.Fatal("real executor adapter not registered")
 	}
-	payload := []byte(`{"model":"echo-model","messages":[{"role":"user","content":"hello"}]}`)
-	req := coreexecutor.Request{Model: "echo-model", Payload: payload, Format: sdktranslator.FormatOpenAI}
+	payload := []byte(`{"model":"echo/echo-model","messages":[{"role":"user","content":"hello"}]}`)
+	req := coreexecutor.Request{Model: "echo/echo-model", Payload: payload, Format: sdktranslator.FormatOpenAI}
 	opts := coreexecutor.Options{SourceFormat: sdktranslator.FormatOpenAI, ResponseFormat: sdktranslator.FormatOpenAI}
 	resp, err := executor.Execute(ctx, auth, req, opts)
 	if err != nil || !strings.Contains(string(resp.Payload), `"total_tokens":5`) {
@@ -177,7 +177,7 @@ func TestRealHostLoader(t *testing.T) {
 		t.Fatalf("count %s %v", count.Payload, err)
 	}
 	streamReq := req
-	streamReq.Payload = []byte(`{"model":"echo-model","stream":true,"messages":[{"role":"user","content":"hello"}]}`)
+	streamReq.Payload = []byte(`{"model":"echo/echo-model","stream":true,"messages":[{"role":"user","content":"hello"}]}`)
 	streamOpts := opts
 	streamOpts.Stream = true
 	stream, err := executor.ExecuteStream(ctx, auth, streamReq, streamOpts)
@@ -218,7 +218,7 @@ func TestRealHostLoader(t *testing.T) {
 		}
 	}
 	limited := req
-	limited.Payload = []byte(`{"model":"echo-model","error":true}`)
+	limited.Payload = []byte(`{"model":"echo/echo-model","error":true}`)
 	_, err = executor.Execute(ctx, auth, limited, opts)
 	status, ok := err.(interface{ StatusCode() int })
 	if !ok || status.StatusCode() != 429 {

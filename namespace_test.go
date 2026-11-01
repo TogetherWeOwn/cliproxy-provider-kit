@@ -91,6 +91,7 @@ func mixedCatalog(ns string) []pluginapi.ModelInfo {
 		mk("bare-model"),
 		mk("other-ns/good-model"),
 		mk(ns + "/" + ns + "/doubled"),
+		mk(ns + "/" + ns),
 		mk(ns + "/"),
 	}
 }
@@ -118,7 +119,7 @@ func TestRegistrationPathsEnforceNamespace(t *testing.T) {
 		decodeResult(t, env.Result, &reg)
 	}
 	// Filtering must not mutate the provider's own lists.
-	if got := modelIDs(stub.register.Models); len(got) != 6 {
+	if got := modelIDs(stub.register.Models); len(got) != 7 {
 		t.Fatalf("provider slice mutated: %q", got)
 	}
 	if got := modelIDs(reg.Models); !equalStrings(got, want) {
@@ -128,6 +129,10 @@ func TestRegistrationPathsEnforceNamespace(t *testing.T) {
 		t.Fatalf("registrations = %+v", reg.Registrations)
 	}
 	if got := modelIDs(reg.Registrations[0].Models); !equalStrings(got, want) {
+		// The provider's cached Registrations entries must keep their originals.
+		if got := modelIDs(stub.register.Registrations[0].Models); len(got) != 7 {
+			t.Fatalf("provider registrations mutated: %q", got)
+		}
 		t.Fatalf("registration entry models = %q, want %q", got, want)
 	}
 
@@ -177,12 +182,12 @@ func TestCheckModelNamespace(t *testing.T) {
 	if err := CheckModelNamespace("zai", good); err != nil {
 		t.Fatalf("good catalog rejected: %v", err)
 	}
-	bad := []pluginapi.ModelInfo{{ID: "zai/glm-5.3"}, {ID: "glm-5.3"}, {ID: "other/glm-5.3"}, {ID: "zai/zai/glm-5.3"}}
+	bad := []pluginapi.ModelInfo{{ID: "zai/glm-5.3"}, {ID: "glm-5.3"}, {ID: "other/glm-5.3"}, {ID: "zai/zai/glm-5.3"}, {ID: "zai/zai"}}
 	err := CheckModelNamespace("zai", bad)
 	if err == nil {
 		t.Fatal("bad catalog accepted")
 	}
-	for _, id := range []string{"glm-5.3", "other/glm-5.3", "zai/zai/glm-5.3"} {
+	for _, id := range []string{"glm-5.3", "other/glm-5.3", "zai/zai/glm-5.3", "zai/zai"} {
 		if !strings.Contains(err.Error(), id) {
 			t.Fatalf("error %q does not name %q", err, id)
 		}

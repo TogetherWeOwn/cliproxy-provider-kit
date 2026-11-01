@@ -344,9 +344,7 @@ func (r *Runtime) dispatch(ctx context.Context, m string, raw []byte, finish fun
 					return resp, err
 				}
 				resp.Models = filterModels(r.def.ModelNamespace, resp.Models)
-				for i := range resp.Registrations {
-					resp.Registrations[i].Models = filterModels(r.def.ModelNamespace, resp.Registrations[i].Models)
-				}
+				resp.Registrations = filterRegistrations(r.def.ModelNamespace, resp.Registrations)
 				return resp, nil
 			})
 			return result, false, err
@@ -359,9 +357,7 @@ func (r *Runtime) dispatch(ctx context.Context, m string, raw []byte, finish fun
 					return resp, err
 				}
 				resp.Models = filterModels(r.def.ModelNamespace, resp.Models)
-				for i := range resp.Registrations {
-					resp.Registrations[i].Models = filterModels(r.def.ModelNamespace, resp.Registrations[i].Models)
-				}
+				resp.Registrations = filterRegistrations(r.def.ModelNamespace, resp.Registrations)
 				return resp, nil
 			})
 			return result, false, err
@@ -374,9 +370,7 @@ func (r *Runtime) dispatch(ctx context.Context, m string, raw []byte, finish fun
 					return resp, err
 				}
 				resp.Models = filterModels(r.def.ModelNamespace, resp.Models)
-				for i := range resp.Registrations {
-					resp.Registrations[i].Models = filterModels(r.def.ModelNamespace, resp.Registrations[i].Models)
-				}
+				resp.Registrations = filterRegistrations(r.def.ModelNamespace, resp.Registrations)
 				return resp, nil
 			})
 			return result, false, err

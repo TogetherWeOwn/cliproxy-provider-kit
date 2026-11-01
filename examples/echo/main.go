@@ -3,9 +3,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync/atomic"
 
 	providerkit "github.com/TogetherWeOwn/cliproxy-provider-kit"
@@ -47,7 +49,11 @@ func makePlugin(host providerkit.Caller) (*providerkit.Runtime, error) {
 		if err != nil {
 			return pluginapi.HTTPRequest{}, err
 		}
-		return pluginapi.HTTPRequest{Method: http.MethodPost, URL: upstream.Load().(string), Headers: http.Header{"Authorization": {"Bearer " + key}, "Content-Type": {"application/json"}}, Body: r.Payload}, nil
+		// The kit serves the namespaced id (echo/echo-model); the upstream
+		// speaks the bare model, so strip exactly one leading namespace
+		// segment before sending, mirroring what real plugins do.
+		body := stripEchoNamespace(r.Payload)
+		return pluginapi.HTTPRequest{Method: http.MethodPost, URL: upstream.Load().(string), Headers: http.Header{"Authorization": {"Bearer " + key}, "Content-Type": {"application/json"}}, Body: body}, nil
 	}, PrepareHTTP: func(_ context.Context, r pluginapi.ExecutorHTTPRequest) (pluginapi.HTTPRequest, error) {
 		key, err := providerkit.APIKey(r.StorageJSON, r.Metadata)
 		if err != nil {
@@ -67,6 +73,26 @@ func makePlugin(host providerkit.Caller) (*providerkit.Runtime, error) {
 	return providerkit.New(providerkit.Definition{Metadata: pluginapi.Metadata{Name: "echo", Version: "0.1.0", Author: "TogetherWeOwn", GitHubRepository: "https://github.com/TogetherWeOwn/cliproxy-provider-kit"}, ModelNamespace: "echo", Configure: configure, Capabilities: pluginapi.Capabilities{
 		AuthProvider: providerkit.APIKeyAuth{Provider: "echo"}, ModelRegistrar: catalog{}, ModelProvider: catalog{}, Executor: executor, ExecutorModelScope: pluginapi.ExecutorModelScopeBoth, ExecutorInputFormats: []string{"openai"}, ExecutorOutputFormats: []string{"openai"}, QuotaProvider: quota,
 	}}, host)
+}
+
+// stripEchoNamespace removes exactly one leading "echo/" from the payload's
+// model field, if present. Bare ids pass through unchanged.
+func stripEchoNamespace(payload []byte) []byte {
+	var body map[string]any
+	if err := json.Unmarshal(payload, &body); err != nil {
+		return payload
+	}
+	model, ok := body["model"].(string)
+	if !ok {
+		return payload
+	}
+	if rest, ok := strings.CutPrefix(model, "echo/"); ok && rest != "" {
+		body["model"] = rest
+		if raw, err := json.Marshal(body); err == nil {
+			return raw
+		}
+	}
+	return payload
 }
 
 type catalog struct{}

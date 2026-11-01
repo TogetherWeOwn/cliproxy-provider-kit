@@ -42,7 +42,7 @@ func ValidateModelNamespace(ns string) error {
 // with "<ns>/".
 func namespaced(ns, id string) bool {
 	rest, ok := strings.CutPrefix(id, ns+"/")
-	if !ok || rest == "" {
+	if !ok || rest == "" || rest == ns {
 		return false
 	}
 	return !strings.HasPrefix(rest, ns+"/")
@@ -58,12 +58,28 @@ func filterModels(ns string, models []pluginapi.ModelInfo) []pluginapi.ModelInfo
 	kept := make([]pluginapi.ModelInfo, 0, len(models))
 	for _, m := range models {
 		if !namespaced(ns, m.ID) {
-			log.Printf("providerkit: dropping model %q: id must start with %q exactly once", m.ID, ns+"/")
+			log.Printf("providerkit: dropping model %.200q: id must start with %q exactly once", m.ID, ns+"/")
 			continue
 		}
 		kept = append(kept, m)
 	}
 	return kept
+}
+
+// filterRegistrations filters every entry's models without mutating the
+// provider's backing array: the Registrations slice itself is copied first,
+// so a registrar reusing a cached response never sees its catalog truncated
+// and concurrent registrations cannot race on shared entries.
+func filterRegistrations(ns string, regs []pluginapi.ProviderModels) []pluginapi.ProviderModels {
+	if len(regs) == 0 {
+		return regs
+	}
+	out := make([]pluginapi.ProviderModels, len(regs))
+	copy(out, regs)
+	for i := range out {
+		out[i].Models = filterModels(ns, out[i].Models)
+	}
+	return out
 }
 
 // CheckModelNamespace is the reusable conformance check for plugin test
