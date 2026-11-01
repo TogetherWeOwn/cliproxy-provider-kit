@@ -103,6 +103,32 @@ func TestAuthParserProviderScopeAndNormalization(t *testing.T) {
 		t.Fatalf("explicit id %+v %v", resp, err)
 	}
 }
+func TestAuthParserPrefixNormalization(t *testing.T) {
+	p := APIKeyAuth{Provider: "echo"}
+	ctx := context.Background()
+	// Surrounding slashes trim exactly like the host filestore, and the
+	// normalized value reaches both the SDK prefix and the persisted metadata.
+	resp, err := p.ParseAuth(ctx, pluginapi.AuthParseRequest{RawJSON: []byte(`{"type":"echo","api_key":"example-key","prefix":" /acct/ "}`)})
+	if err != nil || !resp.Handled || resp.Auth.Prefix != "acct" || resp.Auth.Metadata["prefix"] != "acct" {
+		t.Fatalf("prefix not normalized: %+v %v", resp, err)
+	}
+	// A lone "/" trims to the unpinned state.
+	resp, err = p.ParseAuth(ctx, pluginapi.AuthParseRequest{RawJSON: []byte(`{"type":"echo","api_key":"example-key","prefix":"/"}`)})
+	if err != nil || !resp.Handled || resp.Auth.Prefix != "" {
+		t.Fatalf("slash-only prefix not unpinned: %+v %v", resp, err)
+	}
+	// An inner slash would pin verbatim on the plugin path and merge pinning
+	// namespaces, so it is rejected rather than silently unpinned.
+	for _, raw := range []string{
+		`{"type":"echo","api_key":"example-key","prefix":"a/b"}`,
+		`{"type":"echo","api_key":"example-key","prefix":"team/a/"}`,
+	} {
+		resp, err := p.ParseAuth(ctx, pluginapi.AuthParseRequest{RawJSON: []byte(raw)})
+		if e := MapError(err); e == nil || e.Code != "invalid_auth" || resp.Handled {
+			t.Fatalf("slash prefix accepted %s: %+v %+v", raw, resp, e)
+		}
+	}
+}
 func TestAuthParserValidateHook(t *testing.T) {
 	var seen map[string]any
 	p := APIKeyAuth{Provider: "echo", Validate: func(fields map[string]any) error {
