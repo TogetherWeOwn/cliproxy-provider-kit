@@ -316,7 +316,7 @@ func (r *Runtime) dispatch(ctx context.Context, m string, raw []byte, finish fun
 	switch m {
 	case pluginabi.MethodAuthIdentifier:
 		if c.AuthProvider != nil {
-			return map[string]string{"identifier": c.AuthProvider.Identifier()}, false, nil
+			return authIdentifierResponse(c.AuthProvider), false, nil
 		}
 	case pluginabi.MethodAuthParse:
 		if c.AuthProvider != nil {

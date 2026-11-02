@@ -182,3 +182,69 @@ func TestAuthRefreshKeepsHostStateAndIsolatesStorage(t *testing.T) {
 		t.Fatalf("refreshed storage aliases the request: %s", a.StorageJSON)
 	}
 }
+
+type ownershipExtensionsAuth struct {
+	APIKeyAuth
+	creds []string
+}
+
+func (p ownershipExtensionsAuth) CredentialProviders() []string { return p.creds }
+
+func TestAuthIdentifierForwardsOwnershipExtensions(t *testing.T) {
+	p := ownershipExtensionsAuth{
+		APIKeyAuth: APIKeyAuth{Provider: "meta-muse"},
+		creds:      []string{"meta"},
+	}
+	r := newRuntime(t, Definition{Metadata: metadata(), Capabilities: pluginapi.Capabilities{AuthProvider: p}}, nil)
+	register(t, r)
+	env := rpc(t, r, "auth.identifier", map[string]any{})
+	if !env.OK {
+		t.Fatal(env.Error)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(env.Result, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if string(fields["identifier"]) != `"meta-muse"` {
+		t.Fatalf("identifier %s", env.Result)
+	}
+	if string(fields["credential_providers"]) != `["meta"]` {
+		t.Fatalf("credential_providers %s", env.Result)
+	}
+}
+
+type multiIdentifierAuth struct {
+	APIKeyAuth
+	ids []string
+}
+
+func (p multiIdentifierAuth) Identifiers() []string { return p.ids }
+
+func TestAuthIdentifierResponseForwardsMultiIdentifiers(t *testing.T) {
+	resp := authIdentifierResponse(multiIdentifierAuth{APIKeyAuth: APIKeyAuth{Provider: "echo"}, ids: []string{"echo", "legacy-echo"}})
+	raw, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if string(fields["identifier"]) != `"echo"` || string(fields["identifiers"]) != `["echo","legacy-echo"]` {
+		t.Fatalf("identifiers %s", raw)
+	}
+}
+
+func TestAuthIdentifierOmitsAbsentExtensions(t *testing.T) {
+	raw, err := json.Marshal(authIdentifierResponse(APIKeyAuth{Provider: "echo"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if len(fields) != 1 || string(fields["identifier"]) != `"echo"` {
+		t.Fatalf("unexpected fields %s", raw)
+	}
+}

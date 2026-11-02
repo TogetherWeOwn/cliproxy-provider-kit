@@ -30,6 +30,28 @@ type APIKeyAuth struct {
 
 func (p APIKeyAuth) Identifier() string { return p.Provider }
 
+// credentialProviderSource is the optional extension the host probes (through
+// the auth identifier response) to learn which additional credential types a
+// plugin owns, for example a legacy provider key the plugin takes over.
+type credentialProviderSource interface {
+	CredentialProviders() []string
+}
+
+// authIdentifierResponse builds the auth.identifier result, forwarding the
+// optional MultiAuthProvider and CredentialProviders extensions the host
+// already parses. Without forwarding, extra identifiers would be silently
+// dropped while the host assumes full ownership data.
+func authIdentifierResponse(p pluginapi.AuthProvider) map[string]any {
+	resp := map[string]any{"identifier": p.Identifier()}
+	if multi, ok := p.(pluginapi.MultiAuthProvider); ok && multi != nil {
+		resp["identifiers"] = multi.Identifiers()
+	}
+	if creds, ok := p.(credentialProviderSource); ok && creds != nil {
+		resp["credential_providers"] = creds.CredentialProviders()
+	}
+	return resp
+}
+
 func object(raw []byte) (map[string]any, error) {
 	d := json.NewDecoder(bytes.NewReader(raw))
 	d.UseNumber()
