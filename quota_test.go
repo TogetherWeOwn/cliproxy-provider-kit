@@ -480,12 +480,12 @@ func TestQuotaTransportSpeaksHTTP1ToHTTP2Servers(t *testing.T) {
 // text the panel shows as the row label.
 func TestQuotaWindowLabel(t *testing.T) {
 	for _, tc := range []struct{ in, want string }{
-		{"5h", "5-hour limit"},
-		{"five-hour", "5-hour limit"},
-		{"weekly", "Weekly limit"},
-		{"week", "Weekly limit"},
-		{"monthly", "Monthly limit"},
-		{"daily", "Daily limit"},
+		{"5h", "5h"},
+		{"five-hour", "5h"},
+		{"weekly", "weekly"},
+		{"week", "weekly"},
+		{"monthly", "monthly"},
+		{"daily", "daily"},
 		{"per-minute", "per-minute"},
 	} {
 		if got := QuotaWindowLabel(tc.in); got != tc.want {
@@ -498,7 +498,7 @@ func TestQuotaWindowLabel(t *testing.T) {
 // Description: the panel would show a Description as the row label.
 func TestNewQuotaBucket(t *testing.T) {
 	b := NewQuotaBucket("weekly", 0.5, "2026-11-02T00:00:00Z")
-	if b.Window != "Weekly limit" || b.RemainingFraction != 0.5 || b.ResetTime != "2026-11-02T00:00:00Z" {
+	if b.Window != "weekly" || b.RemainingFraction != 0.5 || b.ResetTime != "2026-11-02T00:00:00Z" {
 		t.Fatalf("wrong bucket: %+v", b)
 	}
 	if b.Description != "" {
@@ -511,11 +511,11 @@ func TestNewQuotaBucket(t *testing.T) {
 // string) renders trimmed, never remapped.
 func TestQuotaWindowLabelCanonical(t *testing.T) {
 	for _, tc := range []struct{ in, want string }{
-		{"5H", "5-hour limit"},
-		{"Weekly", "Weekly limit"},
-		{"MONTHLY", "Monthly limit"},
+		{"5H", "5h"},
+		{"Weekly", "weekly"},
+		{"MONTHLY", "monthly"},
 		{" per-minute ", "per-minute"},
-		{"weekly limit", "Weekly limit"},
+		{"weekly limit", "weekly"},
 		{"weakly", "weakly"},
 		{"", ""},
 	} {
