@@ -20,12 +20,14 @@ const QuotaCacheTTL = 60 * time.Second
 type FetchQuotaFunc func(context.Context, pluginapi.QuotaFetchRequest) (pluginapi.QuotaFetchResponse, error)
 
 // CachedQuota implements a non-resettable SDK quota provider with per-account
-// single-flight fetching, copy isolation, and a 60-second cache. Use Store to
-// incorporate normalized inference response headers by auth identity without
-// another HTTP poll or access to the host's credential context.
+// single-flight fetching, copy isolation, and a configurable cache TTL
+// (default 60 seconds). Use Store to incorporate normalized inference
+// response headers by auth identity without another HTTP poll or access to
+// the host's credential context.
 type CachedQuota struct {
 	provider, display string
 	fetch             FetchQuotaFunc
+	ttl               time.Duration
 	now               func() time.Time
 	mu                sync.Mutex
 	entries           map[quotaKey]*quotaEntry
@@ -42,10 +44,33 @@ type quotaEntry struct {
 	err     error
 }
 
-// NewCachedQuota creates an empty quota cache. The identity and callback are
-// fixed for its lifetime. No background polls or provider requests are started.
+// NewCachedQuota creates an empty quota cache with the default 60-second TTL.
+// The identity and callback are fixed for its lifetime. No background polls
+// or provider requests are started.
 func NewCachedQuota(provider, display string, fetch FetchQuotaFunc) *CachedQuota {
-	return &CachedQuota{provider: provider, display: display, fetch: fetch, now: time.Now, entries: make(map[quotaKey]*quotaEntry), observations: make(map[string]*quotaEntry)}
+	return NewCachedQuotaWithTTL(provider, display, fetch, QuotaCacheTTL)
+}
+
+// NewCachedQuotaWithTTL creates an empty quota cache with a per-plugin TTL
+// for successful per-auth observations. A non-positive TTL falls back to
+// QuotaCacheTTL. Errors are never cached regardless of the TTL. Polls that
+// are expensive or rate-limited (for example a key-envelope read behind a
+// 5-minute connector poll) use a longer TTL so steady state stays within the
+// provider's budget; header observations share the same TTL.
+func NewCachedQuotaWithTTL(provider, display string, fetch FetchQuotaFunc, ttl time.Duration) *CachedQuota {
+	if ttl <= 0 {
+		ttl = QuotaCacheTTL
+	}
+	return &CachedQuota{provider: provider, display: display, fetch: fetch, ttl: ttl, now: time.Now, entries: make(map[quotaKey]*quotaEntry), observations: make(map[string]*quotaEntry)}
+}
+
+// cacheTTL returns the configured TTL, defaulting for zero-value caches built
+// before the TTL field existed.
+func (q *CachedQuota) cacheTTL() time.Duration {
+	if q == nil || q.ttl <= 0 {
+		return QuotaCacheTTL
+	}
+	return q.ttl
 }
 func (q *CachedQuota) Identifier() string { return q.provider }
 func (q *CachedQuota) DescribeQuota(context.Context, pluginapi.QuotaDescribeRequest) (pluginapi.QuotaDescribeResponse, error) {
@@ -147,7 +172,7 @@ func (q *CachedQuota) FetchQuota(ctx context.Context, r pluginapi.QuotaFetchRequ
 		}
 	}()
 	q.mu.Lock()
-	e.expires = q.now().Add(QuotaCacheTTL)
+	e.expires = q.now().Add(q.cacheTTL())
 	if e.err != nil && q.entries[key] == e {
 		delete(q.entries, key)
 	}
@@ -174,7 +199,7 @@ func (q *CachedQuota) Store(r pluginapi.QuotaFetchRequest, out pluginapi.QuotaFe
 	e := &quotaEntry{ready: make(chan struct{}), raw: raw}
 	close(e.ready)
 	q.mu.Lock()
-	e.expires = q.now().Add(QuotaCacheTTL)
+	e.expires = q.now().Add(q.cacheTTL())
 	q.observations[id] = e
 	q.mu.Unlock()
 	return nil

@@ -16,8 +16,9 @@ const maxQuotaBody = 1 << 20
 // QuotaHTTPTimeout bounds the entire quota HTTP exchange, including body reads.
 const QuotaHTTPTimeout = 15 * time.Second
 
-// QuotaHTTPClient is a bounded, secret-redacting read-only polling helper.
-// It performs no logging. Errors omit URLs, headers, bodies and transport text.
+// QuotaHTTPClient is a bounded, secret-redacting polling helper for
+// quota/discovery reads. It performs no logging. Errors omit URLs, headers,
+// bodies and transport text.
 // This is deliberately separate from HostHTTPClient: ABI 1 / schema 10 has no
 // no-redirect setting. Executors must always use the host client instead.
 // The transport may implement a provider's deployment proxy policy. Its RoundTrip
@@ -55,15 +56,21 @@ func NewQuotaHTTPClient(transport http.RoundTripper) *QuotaHTTPClient {
 	return &QuotaHTTPClient{client: &http.Client{Transport: transport, Timeout: QuotaHTTPTimeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 }
 
-// Do reads a quota/discovery resource. Only GET is allowed, to keep this helper
-// out of the inference execution path. Successful bodies are returned to the
+// Do reads a quota/discovery resource. Only GET and POST are allowed: quota
+// endpoints that mint or refresh a read-only view (GraphQL, key envelope
+// reads) use POST without becoming an inference or mutation path, and every
+// other method stays rejected. Successful bodies are returned to the
 // provider parser; callers must never log them or credential-bearing headers.
 func (c *QuotaHTTPClient) Do(ctx context.Context, r pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
 	if err := ctx.Err(); err != nil {
 		return pluginapi.HTTPResponse{}, err
 	}
-	if r.Method != "" && r.Method != http.MethodGet {
-		return pluginapi.HTTPResponse{}, rpcError("invalid_request", "quota HTTP helper only supports GET", 400)
+	method := r.Method
+	if method == "" {
+		method = http.MethodGet
+	}
+	if method != http.MethodGet && method != http.MethodPost {
+		return pluginapi.HTTPResponse{}, rpcError("invalid_request", "quota HTTP helper only supports GET and POST", 400)
 	}
 	// Fail closed: never fall back to a direct connection for a bad proxy setting.
 	if raw, ok := ctx.Value(proxyContextKey{}).(string); ok {
@@ -71,7 +78,7 @@ func (c *QuotaHTTPClient) Do(ctx context.Context, r pluginapi.HTTPRequest) (plug
 			return pluginapi.HTTPResponse{}, rpcError("invalid_proxy", "invalid quota proxy setting", 400)
 		}
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.URL, bytes.NewReader(r.Body))
+	req, err := http.NewRequestWithContext(ctx, method, r.URL, bytes.NewReader(r.Body))
 	if err != nil {
 		return pluginapi.HTTPResponse{}, rpcError("quota_http_error", "invalid quota request", 400)
 	}

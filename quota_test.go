@@ -70,6 +70,53 @@ func TestQuotaCacheTTLPerAuthAndCopies(t *testing.T) {
 		t.Fatal("fake reset")
 	}
 }
+
+// Polls that are expensive or rate-limited (for example a key-envelope read
+// behind a 5-minute connector poll) use a longer per-plugin TTL so steady
+// state stays within the provider's budget.
+func TestCachedQuotaWithTTL(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	var calls int
+	q := NewCachedQuotaWithTTL("echo", "Echo", func(context.Context, pluginapi.QuotaFetchRequest) (pluginapi.QuotaFetchResponse, error) {
+		calls++
+		return quotaFixture(.75), nil
+	}, 30*time.Minute)
+	q.now = func() time.Time { return now }
+	req := pluginapi.QuotaFetchRequest{AuthID: "a", Provider: "echo", StorageJSON: []byte(`{"api_key":"example-key"}`)}
+	if _, err := q.FetchQuota(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(29 * time.Minute)
+	if _, err := q.FetchQuota(context.Background(), req); err != nil || calls != 1 {
+		t.Fatalf("early expiry, calls %d err %v", calls, err)
+	}
+	now = now.Add(time.Minute)
+	if _, err := q.FetchQuota(context.Background(), req); err != nil || calls != 2 {
+		t.Fatalf("cache not expired at 30 minutes, calls %d err %v", calls, err)
+	}
+	// Header observations share the same TTL.
+	if err := q.Store(pluginapi.QuotaFetchRequest{AuthID: "a"}, quotaFixture(.9)); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(29 * time.Minute)
+	if resp, err := q.FetchQuota(context.Background(), req); err != nil || resp.Groups[0].Buckets[0].RemainingFraction != .9 || calls != 2 {
+		t.Fatalf("observation expired early %+v calls %d err %v", resp, calls, err)
+	}
+	now = now.Add(time.Minute)
+	if _, err := q.FetchQuota(context.Background(), req); err != nil || calls != 3 {
+		t.Fatalf("observation not expired at 30 minutes, calls %d err %v", calls, err)
+	}
+	// A non-positive TTL falls back to the 60-second default.
+	fallback := NewCachedQuotaWithTTL("echo", "Echo", func(context.Context, pluginapi.QuotaFetchRequest) (pluginapi.QuotaFetchResponse, error) {
+		return quotaFixture(.5), nil
+	}, 0)
+	if got := fallback.cacheTTL(); got != QuotaCacheTTL {
+		t.Fatalf("zero TTL = %v, want %v", got, QuotaCacheTTL)
+	}
+	if got := (*CachedQuota)(nil).cacheTTL(); got != QuotaCacheTTL {
+		t.Fatalf("nil cache TTL = %v, want %v", got, QuotaCacheTTL)
+	}
+}
 func TestQuotaHeaderObservationMatchesEnrichedFetch(t *testing.T) {
 	var calls int
 	q := NewCachedQuota("echo", "Echo", func(context.Context, pluginapi.QuotaFetchRequest) (pluginapi.QuotaFetchResponse, error) {
@@ -395,6 +442,13 @@ func TestQuotaHTTPMethodAndStatusClassification(t *testing.T) {
 			if r.Method != http.MethodGet || r.Header.Get("Authorization") != "Bearer example-key" {
 				w.WriteHeader(400)
 			}
+		case "/post-echo":
+			if r.Method != http.MethodPost {
+				w.WriteHeader(400)
+				return
+			}
+			body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+			_, _ = w.Write([]byte("post:" + string(body) + "\n"))
 		case "/limited":
 			w.Header().Set("Retry-After", "7")
 			w.WriteHeader(429)
@@ -412,8 +466,11 @@ func TestQuotaHTTPMethodAndStatusClassification(t *testing.T) {
 	defer s.Close()
 	c := NewQuotaHTTPClient(nil)
 	defer c.CloseIdleConnections()
-	// The helper is read-only so it can never become an inference or mutation path.
-	for _, method := range []string{http.MethodPost, http.MethodDelete, "get"} {
+	// The helper is polling-only so it can never become an inference or
+	// mutation path: only GET and POST are allowed (quota endpoints that
+	// mint or refresh a read-only view, such as GraphQL or key-envelope
+	// reads, use POST), and every other method stays rejected.
+	for _, method := range []string{http.MethodDelete, http.MethodPut, "get"} {
 		_, err := c.Do(context.Background(), pluginapi.HTTPRequest{Method: method, URL: s.URL + "/headers", Body: []byte(`{}`)})
 		if e := MapError(err); e.Code != "invalid_request" || e.HTTPStatus != 400 {
 			t.Fatalf("%s accepted: %+v", method, e)
@@ -424,6 +481,15 @@ func TestQuotaHTTPMethodAndStatusClassification(t *testing.T) {
 	}
 	if resp, err := c.Do(context.Background(), pluginapi.HTTPRequest{Method: http.MethodGet, URL: s.URL + "/headers", Headers: http.Header{"Authorization": {"Bearer example-key"}}}); err != nil || resp.StatusCode != 200 {
 		t.Fatalf("headers %+v %v", resp, err)
+	}
+	// POST reaches the endpoint with its body: key-envelope reads keep the
+	// credential in the header while the envelope travels in the body.
+	postHits := hits.Load()
+	if resp, err := c.Do(context.Background(), pluginapi.HTTPRequest{Method: http.MethodPost, URL: s.URL + "/post-echo", Headers: http.Header{"Content-Type": {"application/json"}}, Body: []byte(`{}`)}); err != nil || resp.StatusCode != 200 || string(resp.Body) != "post:{}\n" {
+		t.Fatalf("post echo %+v %q %v", resp, resp.Body, err)
+	}
+	if hits.Load() != postHits+1 {
+		t.Fatalf("POST did not reach the endpoint (hits %d, want %d)", hits.Load(), postHits+1)
 	}
 	for _, tc := range []struct {
 		path      string
