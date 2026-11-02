@@ -18,14 +18,17 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
-// Canonical short row labels for quota windows, matching the official
-// provider cards. Keep Window values short; staging screenshots must
-// confirm multi-window order after relabelling.
+// Canonical window ids for quota rows, matching the spellings the panel
+// resolves to a countdown timeline and stable sort order ("5h", "weekly").
+// Window values stay short ids so long labels are never truncated; the panel
+// shows the Window as the row label. Other windows ("daily", "monthly",
+// provider-specific names) render without a countdown but keep their reset
+// text. Keep values lowercase: the panel matches case-insensitively.
 const (
-	CardWindowFiveHour = "5-hour limit"
-	CardWindowWeekly   = "Weekly limit"
-	CardWindowMonthly  = "Monthly limit"
-	CardWindowDaily    = "Daily limit"
+	CardWindowFiveHour = "5h"
+	CardWindowWeekly   = "weekly"
+	CardWindowMonthly  = "monthly"
+	CardWindowDaily    = "daily"
 )
 
 // MaxCardSummaryChips bounds the plan-row chip count (plan chip excluded).
