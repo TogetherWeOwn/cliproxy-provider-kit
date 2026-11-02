@@ -18,14 +18,14 @@ import (
 // by Runtime unless explicitly represented as public pluginabi.Error values.
 // It is stateless: duplicate-file/account policy belongs to the provider.
 //
-// Login optionally enables the management-UI login flow: StartLogin serves a
-// login page through the plugin ManagementAPI/resource routes and PollLogin
-// returns the submitted key. A nil Login keeps the historical behavior of
-// rejecting both calls with api_key_only.
+// There is no login flow: StartLogin and PollLogin always fail with
+// api_key_only, so API-key providers show no login card in the management UI
+// and auth files load through the host's generic file path. (TWO-1257 removed
+// the script-based API-key login page; OpenRouter-style OAuth/PKCE logins
+// live in the provider, not in the kit.)
 type APIKeyAuth struct {
 	Provider string
 	Validate func(map[string]any) error
-	Login    *APIKeyLogin
 }
 
 func (p APIKeyAuth) Identifier() string { return p.Provider }
@@ -162,17 +162,11 @@ func (p APIKeyAuth) ParseAuth(_ context.Context, req pluginapi.AuthParseRequest)
 	}
 	return pluginapi.AuthParseResponse{Handled: true, Auth: auth}, nil
 }
-func (p APIKeyAuth) StartLogin(ctx context.Context, req pluginapi.AuthLoginStartRequest) (pluginapi.AuthLoginStartResponse, error) {
-	if p.Login == nil {
-		return pluginapi.AuthLoginStartResponse{}, rpcError("api_key_only", "API-key only: create an auth JSON file", 400)
-	}
-	return p.Login.StartLogin(ctx, req)
+func (p APIKeyAuth) StartLogin(_ context.Context, _ pluginapi.AuthLoginStartRequest) (pluginapi.AuthLoginStartResponse, error) {
+	return pluginapi.AuthLoginStartResponse{}, rpcError("api_key_only", "API-key only: create an auth JSON file", 400)
 }
-func (p APIKeyAuth) PollLogin(ctx context.Context, req pluginapi.AuthLoginPollRequest) (pluginapi.AuthLoginPollResponse, error) {
-	if p.Login == nil {
-		return pluginapi.AuthLoginPollResponse{}, rpcError("api_key_only", "API-key only: create an auth JSON file", 400)
-	}
-	return p.Login.PollLogin(ctx, req)
+func (p APIKeyAuth) PollLogin(_ context.Context, _ pluginapi.AuthLoginPollRequest) (pluginapi.AuthLoginPollResponse, error) {
+	return pluginapi.AuthLoginPollResponse{}, rpcError("api_key_only", "API-key only: create an auth JSON file", 400)
 }
 func (p APIKeyAuth) RefreshAuth(_ context.Context, req pluginapi.AuthRefreshRequest) (pluginapi.AuthRefreshResponse, error) {
 	if _, err := APIKey(req.StorageJSON, req.Metadata); err != nil {

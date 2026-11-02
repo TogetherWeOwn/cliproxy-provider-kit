@@ -6,20 +6,21 @@ import (
 	"time"
 )
 
-// Provisional (login-validation) parses.
+// Provisional (pre-save validation) parses.
 //
-// APIKeyLogin validates each submitted key through the provider's full
-// ParseAuth pipeline before the login is polled or the host saves an auth
-// file. A provider that records filename ownership of a key during any parse
-// would keep that claim even when the operator abandons the login, so a
-// later upload of the same key under a different filename fails as a
-// duplicate even though no login file exists.
+// A caller that validates a key through the provider's full ParseAuth
+// pipeline before the host saves an auth file (the removed API-key login
+// page did this for every submit) must mark that parse as provisional: a
+// provider that records filename ownership of a key during any parse would
+// keep that claim even when the operator abandons the flow, so a later
+// upload of the same key under a different filename fails as a duplicate
+// even though no file exists.
 //
-// The login submit therefore marks its validation parse as provisional: the
-// context handed to APIKeyLoginConfig.Parse carries the login session's
-// expiry. Ownership guards must treat a provisional parse as a check, not a
-// commit. Providers using KeyOwnership get that behavior automatically;
-// a hand-rolled guard should consult ProvisionalParseExpiry and, for a
+// The validation caller therefore marks its parse as provisional via
+// withProvisionalParse, carrying the session expiry in the context.
+// Ownership guards must treat a provisional parse as a check, not a commit.
+// Providers using KeyOwnership get that behavior automatically; a
+// hand-rolled guard should consult ProvisionalParseExpiry and, for a
 // provisional parse, reject duplicates owned by another filename without
 // recording ownership of its own (or record it only until the expiry).
 
@@ -32,10 +33,10 @@ func withProvisionalParse(ctx context.Context, expiresAt time.Time) context.Cont
 	return context.WithValue(ctx, provisionalParseKey{}, expiresAt)
 }
 
-// ProvisionalParseExpiry reports whether ctx belongs to a login-validation
-// parse (see APIKeyLogin) and, if so, when the login session behind it
-// expires. Parses the host initiates for real auth files are never
-// provisional.
+// ProvisionalParseExpiry reports whether ctx belongs to a provisional
+// pre-save validation parse (see withProvisionalParse) and, if so, when the
+// session behind it expires. Parses the host initiates for real auth files
+// are never provisional.
 func ProvisionalParseExpiry(ctx context.Context) (time.Time, bool) {
 	if ctx == nil {
 		return time.Time{}, false
