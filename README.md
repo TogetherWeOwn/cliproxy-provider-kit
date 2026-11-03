@@ -38,7 +38,11 @@ func init() {
                 GitHubRepository: "https://github.com/example/provider",
             },
             Capabilities: pluginapi.Capabilities{
-                AuthProvider: providerkit.APIKeyAuth{Provider: "example-provider"},
+                // API-key providers must omit AuthProvider: there is no login
+                // flow (StartLogin/PollLogin fail with api_key_only), so a
+                // registered provider would advertise a login card that can
+                // only fail. Auth files load through the host's generic file
+                // path instead.
                 // Add ModelRegistrar / ModelProvider, Executor, QuotaProvider,
                 // and optionally UsagePlugin implemented by your provider.
             },
