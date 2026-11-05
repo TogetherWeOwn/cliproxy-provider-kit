@@ -148,6 +148,21 @@ func (p APIKeyAuth) ParseAuth(_ context.Context, req pluginapi.AuthParseRequest)
 		digest := sha256.Sum256([]byte(key))
 		id = p.Provider + ":" + hex.EncodeToString(digest[:6])
 	}
+	// Normalize the prefix exactly like the host filestore: the plugin path
+	// pins whatever ParseAuth returns verbatim, so a slashed prefix must be
+	// rejected here rather than silently treated as unpinned downstream.
+	// The normalized value is written back so SDK metadata agrees with Prefix.
+	if value, exists := fields["prefix"]; exists {
+		prefix, ok := value.(string)
+		if !ok {
+			return pluginapi.AuthParseResponse{}, rpcError("invalid_auth", "host auth text fields must be strings", 400)
+		}
+		normalized, err := NormalizePrefix(prefix)
+		if err != nil {
+			return pluginapi.AuthParseResponse{}, err
+		}
+		fields["prefix"] = normalized
+	}
 	text := func(name string) string { value, _ := fields[name].(string); return strings.TrimSpace(value) }
 	auth := pluginapi.AuthData{Provider: p.Provider, ID: id, FileName: req.FileName, Label: text("label"), Prefix: text("prefix"), ProxyURL: text("proxy_url"), Disabled: disabled, Attributes: attrs, Metadata: map[string]any{"type": p.Provider}}
 	for _, name := range []string{"id", "label", "prefix", "proxy_url", "disabled", "weight", "priority"} {
