@@ -124,8 +124,11 @@ func TestClientWantsBareJSON(t *testing.T) {
 		{"openai", "/v1/responses", false},
 		{"openai", "/v1beta/models/*action", false},
 		{"openai", "", false},
-		// Only OpenAI output is ever re-framed: translators and native
-		// host paths consume framed SSE with event names.
+		// Cross-protocol translators consume data: lines, while the native
+		// Gemini HTTP writer adds its own envelope just like OpenAI chat.
+		{"gemini", "/v1beta/models/model:streamGenerateContent", true},
+		{"gemini", "/v1/chat/completions", false},
+		{"gemini", "", false},
 		{"claude", "/v1/chat/completions", false},
 		{"claude", "/v1/messages", false},
 		{"openai-response", "/v1/chat/completions", false},

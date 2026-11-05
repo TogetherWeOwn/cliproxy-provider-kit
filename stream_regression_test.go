@@ -151,7 +151,9 @@ func TestClientWantsNativeSSE(t *testing.T) {
 		{"claude", "", true},
 		{"openai-response", "/v1/responses", true},
 		{"openai-response", "/v1/messages", false},
-		{"gemini", "/v1beta/models/model:streamGenerateContent", true},
+		{"gemini", "/v1beta/models/model:streamGenerateContent", false},
+		{"gemini", "/v1/messages", false},
+		{"gemini", "", true},
 	} {
 		r := pluginapi.ExecutorRequest{Format: tc.format, Metadata: map[string]any{"request_path": tc.path}}
 		if got := clientWantsNativeSSE(r); got != tc.want {

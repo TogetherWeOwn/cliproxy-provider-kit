@@ -17,9 +17,10 @@ import (
 const maxStreamEventBytes = 8 << 20
 
 type streamFraming struct {
-	bare     bool // OpenAI chat handlers add their own data: prefix
-	native   bool // native handlers write complete, named SSE events verbatim
-	dropDone bool // stop at [DONE]; the OpenAI host appends its own terminator
+	bare           bool // OpenAI chat and Gemini handlers add their own data: prefix
+	native         bool // Claude/Responses handlers write native SSE bytes verbatim
+	dropDone       bool // stop at [DONE]; the OpenAI host appends its own terminator
+	rejectBareJSON bool // missing Content-Type leaves JSON versus SSE ambiguous
 }
 
 // frameStreamChunks implements the OpenAI-output chunk contract: bare JSON for
@@ -31,10 +32,10 @@ func frameStreamChunks(ctx context.Context, in <-chan pluginapi.ExecutorStreamCh
 }
 
 // frameSSEChunks splits raw HTTP reads into complete SSE events. Translators
-// consume one data: line per call (v8.0.49 adapters_executors.go); native handlers
-// write full events, including event names and blank-line delimiters. CR, LF and
-// CRLF are accepted, even across reads. Only a stream-leading UTF-8 BOM is ignored.
-// A partial event cut short by an upstream error is never delivered.
+// consume one data: line per call (v8.0.49 adapters_executors.go); native SSE
+// handlers write full events and standalone comment lines. CR, LF and CRLF are
+// accepted, even across reads. Only a stream-leading UTF-8 BOM is ignored.
+// Unfinished data/metadata events are never delivered on a native route.
 func frameSSEChunks(ctx context.Context, in <-chan pluginapi.ExecutorStreamChunk, framing streamFraming, onExit func()) <-chan pluginapi.ExecutorStreamChunk {
 	out := make(chan pluginapi.ExecutorStreamChunk)
 	go func() {
@@ -57,7 +58,7 @@ func frameSSEChunks(ctx context.Context, in <-chan pluginapi.ExecutorStreamChunk
 		}
 		dispatch := func() error {
 			if framing.native {
-				if len(nativeEvent) == 0 {
+				if nativeBytes == 0 {
 					return nil
 				}
 				payload := append(nativeEvent, '\n')
@@ -124,7 +125,7 @@ func frameSSEChunks(ctx context.Context, in <-chan pluginapi.ExecutorStreamChunk
 			}
 			return nil
 		}
-		field := func(l []byte) error {
+		field := func(l []byte, terminated bool) error {
 			if err := checkLine(l, true); err != nil {
 				return err
 			}
@@ -134,15 +135,22 @@ func frameSSEChunks(ctx context.Context, in <-chan pluginapi.ExecutorStreamChunk
 				return dispatch()
 			}
 			v, data := dataValue(l)
-			if !data {
-				// Missing Content-Type retains the SSE assumption. Do not turn
-				// unsupported bare JSON/NDJSON into an empty successful stream.
+			if !data && framing.rejectBareJSON {
+				// Only a missing Content-Type is ambiguous. Explicit SSE permits
+				// JSON-looking unknown fields, including colonless fields.
 				v := bytes.TrimSpace(l)
 				if len(v) > 0 && (v[0] == '{' || v[0] == '[' || json.Valid(v)) {
 					return invalidStreamChunk("invalid_stream: expected SSE fields, received bare JSON")
 				}
 			}
 			if framing.native {
+				if terminated && l[0] == ':' && len(nativeEvent) == 0 {
+					// Standalone comments keep native connections live without a
+					// blank line. Charge them until the real event delimiter, and
+					// never let a comment overtake buffered data/metadata fields.
+					nativeBytes += len(l) + 1
+					return send(pluginapi.ExecutorStreamChunk{Payload: append(bytes.Clone(l), '\n')})
+				}
 				// Retain fields in source order, including metadata-only events,
 				// comments and unknown fields. The downstream SSE client applies
 				// id/retry validation; do not invent or persist parser state here.
@@ -168,7 +176,7 @@ func frameSSEChunks(ctx context.Context, in <-chan pluginapi.ExecutorStreamChunk
 				case c, ok := <-in:
 					if !ok {
 						if len(line) > 0 {
-							if err := field(line); err != nil {
+							if err := field(line, false); err != nil {
 								return err
 							}
 						}
@@ -207,7 +215,7 @@ func frameSSEChunks(ctx context.Context, in <-chan pluginapi.ExecutorStreamChunk
 						if i < 0 {
 							break
 						}
-						if err := field(line); err != nil {
+						if err := field(line, true); err != nil {
 							return err
 						}
 						line = line[:0]
@@ -249,11 +257,13 @@ func streamRequestPath(r pluginapi.ExecutorRequest) string {
 }
 
 func clientWantsBareJSON(r pluginapi.ExecutorRequest) bool {
-	if !openAIOutputFormat(r) {
-		return false
-	}
 	path := streamRequestPath(r)
-	return strings.HasSuffix(path, "/chat/completions") || strings.HasSuffix(path, "/v1/completions")
+	if openAIOutputFormat(r) {
+		return strings.HasSuffix(path, "/chat/completions") || strings.HasSuffix(path, "/v1/completions")
+	}
+	// Same-format Gemini bypasses translation, but its HTTP writer adds the
+	// SSE envelope (default/alt=sse) or writes raw data (other alt modes).
+	return r.Format == "gemini" && strings.Contains(path, "/models/")
 }
 
 // Native handlers write SSE verbatim; translators require only one data: line.
@@ -271,7 +281,7 @@ func clientWantsNativeSSE(r pluginapi.ExecutorRequest) bool {
 	case strings.HasSuffix(path, "/responses"):
 		return r.Format == "openai-response"
 	case strings.Contains(path, "/models/"):
-		return r.Format == "gemini"
+		return false // Gemini's writer expects payloads, not native SSE
 	default:
 		return true
 	}

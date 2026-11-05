@@ -23,7 +23,7 @@ func TestSSEReviewRegressions(t *testing.T) {
 		} {
 			for split := 0; split <= len(wire); split++ {
 				got, errs := collectStream(t, frameSSEChunks(context.Background(), streamFeed(streamBytes(wire[:split]), streamBytes(wire[split:])), streamFraming{native: true}, nil))
-				if len(errs) != 0 || !reflect.DeepEqual(got, []string{wire}) {
+				if len(errs) != 0 || strings.Join(got, "") != wire {
 					t.Errorf("wire=%q split=%d: got %q errs %v", wire, split, got, errs)
 					break
 				}
@@ -81,7 +81,13 @@ func TestSSEReviewRegressions(t *testing.T) {
 			// Metadata-only events must also be bounded cumulatively.
 			wire := field + string(bytes.Repeat([]byte("1"), maxStreamEventBytes/2)) + "\n" + field + string(bytes.Repeat([]byte("2"), maxStreamEventBytes/2)) + "\n\n"
 			got, errs := collectStream(t, frameSSEChunks(context.Background(), streamFeed(streamBytes(wire)), streamFraming{native: true}, nil))
-			if len(got) != 0 || len(errs) != 1 || streamRPC(t, errs[0]).Code != "invalid_stream" {
+			want := ""
+			if field == ": " {
+				// Completed standalone comments are delivered promptly, but still
+				// count against the cumulative budget until a blank line.
+				want = strings.SplitN(wire, "\n", 2)[0] + "\n"
+			}
+			if strings.Join(got, "") != want || len(errs) != 1 || streamRPC(t, errs[0]).Code != "invalid_stream" {
 				t.Fatalf("field=%q: events %d errs %v", field, len(got), errs)
 			}
 		}

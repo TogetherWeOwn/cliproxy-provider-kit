@@ -16,9 +16,10 @@ import (
 // endpoint and authentication; it must preserve the host's final business payload
 // (the host already applied payload rules). No protocol translation is done here.
 // ExecuteStream re-frames SSE upstream bytes into one host chunk per data
-// event: data lines for translators, bare JSON for OpenAI chat clients, full
-// named events for native clients. Other Content-Types pass through unchanged;
-// they are not parsed as SSE. Callers must not frame again.
+// event: data lines for translators, bare JSON for OpenAI chat/Gemini clients,
+// full named events and standalone comment lines for native SSE clients. Other
+// Content-Types pass through unchanged; they are not parsed as SSE. Callers must
+// not frame again.
 // HttpRequest copies the supplied HTTP request unless PrepareHTTP is provided.
 // Every network operation uses the injected HostHTTPClient; there is no fallback.
 // Provider-specific quota/exhaustion classification belongs in ClassifyError.
@@ -136,7 +137,10 @@ func (p Passthrough) ExecuteStream(ctx context.Context, r pluginapi.ExecutorRequ
 	// If framing fails the parser stops reading while the forwarder may still
 	// be blocked sending into raw, so release the upstream when it exits.
 	// cancel is idempotent: the forwarder already defers it.
-	framing := streamFraming{bare: clientWantsBareJSON(r), native: clientWantsNativeSSE(r), dropDone: openAIOutputFormat(r)}
+	framing := streamFraming{
+		bare: clientWantsBareJSON(r), native: clientWantsNativeSSE(r), dropDone: openAIOutputFormat(r),
+		rejectBareJSON: resp.Headers.Get("Content-Type") == "",
+	}
 	return pluginapi.ExecutorStreamResponse{Headers: resp.Headers, Chunks: frameSSEChunks(ctx, raw, framing, cancel)}, nil
 }
 
