@@ -108,12 +108,18 @@ func TestAuthParserPrefixNormalization(t *testing.T) {
 	ctx := context.Background()
 	// Surrounding slashes trim exactly like the host filestore, and the
 	// normalized value reaches both the SDK prefix and the persisted metadata.
-	resp, err := p.ParseAuth(ctx, pluginapi.AuthParseRequest{RawJSON: []byte(`{"type":"echo","api_key":"example-key","prefix":" /acct/ "}`)})
-	if err != nil || !resp.Handled || resp.Auth.Prefix != "acct" || resp.Auth.Metadata["prefix"] != "acct" {
-		t.Fatalf("prefix not normalized: %+v %v", resp, err)
+	for _, prefix := range []string{" /acct/ ", " / acct / ", "/\tacct\t/"} {
+		raw, err := json.Marshal(map[string]string{"type": "echo", "api_key": "example-key", "prefix": prefix})
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := p.ParseAuth(ctx, pluginapi.AuthParseRequest{RawJSON: raw})
+		if err != nil || !resp.Handled || resp.Auth.Prefix != "acct" || resp.Auth.Metadata["prefix"] != "acct" {
+			t.Fatalf("prefix %q not normalized: %+v %v", prefix, resp, err)
+		}
 	}
 	// A lone "/" trims to the unpinned state.
-	resp, err = p.ParseAuth(ctx, pluginapi.AuthParseRequest{RawJSON: []byte(`{"type":"echo","api_key":"example-key","prefix":"/"}`)})
+	resp, err := p.ParseAuth(ctx, pluginapi.AuthParseRequest{RawJSON: []byte(`{"type":"echo","api_key":"example-key","prefix":"/"}`)})
 	if err != nil || !resp.Handled || resp.Auth.Prefix != "" {
 		t.Fatalf("slash-only prefix not unpinned: %+v %v", resp, err)
 	}

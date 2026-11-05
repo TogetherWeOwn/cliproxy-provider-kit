@@ -44,7 +44,7 @@ type fileClaim struct {
 // would leave two files sharing one host namespace while the tracker believes
 // both are unpinned. The programme rule is never to silently drop: reject.
 func normalizePrefix(prefix string) (string, error) {
-	prefix = strings.Trim(strings.TrimSpace(prefix), "/")
+	prefix = strings.TrimSpace(strings.Trim(strings.TrimSpace(prefix), "/"))
 	if strings.Contains(prefix, "/") {
 		return "", rpcError("invalid_auth", "prefix must not contain \"/\"", 400)
 	}

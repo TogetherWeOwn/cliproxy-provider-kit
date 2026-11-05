@@ -28,6 +28,24 @@ func TestPrefixClaimsRejectSharedPrefix(t *testing.T) {
 	}
 }
 
+func TestPrefixClaimsWhitespaceInsideSlashes(t *testing.T) {
+	for _, prefix := range []string{" / acct / ", "/\tacct\t/"} {
+		t.Run(prefix, func(t *testing.T) {
+			var claims PrefixClaims
+			if err := claims.Claim("a.json", prefix, []byte("key-one")); err != nil {
+				t.Fatal(err)
+			}
+			if err := claims.Claim("b.json", "acct", []byte("key-two")); err == nil || MapError(err).Code != "duplicate_prefix" {
+				t.Fatalf("normalized prefix collision accepted: %v", err)
+			}
+			claims.Release("a.json")
+			if err := claims.Claim("b.json", "acct", []byte("key-two")); err != nil {
+				t.Fatalf("release did not free normalized prefix: %v", err)
+			}
+		})
+	}
+}
+
 func TestPrefixClaimsDuplicateKeyAcrossFiles(t *testing.T) {
 	var claims PrefixClaims
 	if err := claims.Claim("a.json", "acct-a", []byte("same-key")); err != nil {
@@ -126,6 +144,44 @@ func TestQuotaObservationBindingWithCustomTTL(t *testing.T) {
 			now = now.Add(3 * time.Minute)
 			if resp, err := q.FetchQuota(context.Background(), req); err != nil || resp.Groups[0].Buckets[0].RemainingFraction != .5 || calls != wantCalls+1 {
 				t.Fatalf("observation did not expire: %+v calls %d %v", resp, calls, err)
+			}
+		})
+	}
+}
+
+func TestQuotaObservationRequiresMatchingContext(t *testing.T) {
+	for name, req := range map[string]pluginapi.QuotaFetchRequest{
+		"storage only":      {},
+		"host enrichment":   {Metadata: map[string]any{"label": "Example"}, Attributes: map[string]string{"path": "a.json"}},
+		"metadata override": {Metadata: map[string]any{"api_key": "replacement-key"}},
+		"attribute context": {Attributes: map[string]string{"account": "other-account"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			calls := 0
+			q := NewCachedQuota("echo", "Echo", func(context.Context, pluginapi.QuotaFetchRequest) (pluginapi.QuotaFetchResponse, error) {
+				calls++
+				return quotaFixture(.5), nil
+			})
+			stored := pluginapi.QuotaFetchRequest{AuthID: "a", Provider: "echo", StorageJSON: []byte(`{"api_key":"original-key"}`)}
+			if err := q.Store(stored, quotaFixture(.9)); err != nil {
+				t.Fatal(err)
+			}
+			req.AuthID, req.Provider, req.StorageJSON = stored.AuthID, stored.Provider, stored.StorageJSON
+			want, wantCalls := .5, 1
+			if name == "storage only" {
+				want, wantCalls = .9, 0
+			}
+			resp, err := q.FetchQuota(context.Background(), req)
+			if err != nil || resp.Groups[0].Buckets[0].RemainingFraction != want || calls != wantCalls {
+				t.Fatalf("context binding ignored: %+v calls %d %v", resp, calls, err)
+			}
+			// Callers with the complete fetch context retain the header fast path.
+			if err := q.Store(req, quotaFixture(.8)); err != nil {
+				t.Fatal(err)
+			}
+			resp, err = q.FetchQuota(context.Background(), req)
+			if err != nil || resp.Groups[0].Buckets[0].RemainingFraction != .8 || calls != wantCalls {
+				t.Fatalf("matching context missed: %+v calls %d %v", resp, calls, err)
 			}
 		})
 	}
