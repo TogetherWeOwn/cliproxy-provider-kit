@@ -563,7 +563,7 @@ func TestQuotaWindowLabel(t *testing.T) {
 // TestNewQuotaBucket proves card rows carry the canonical label and never a
 // Description: the panel would show a Description as the row label.
 func TestNewQuotaBucket(t *testing.T) {
-	b := NewQuotaBucket("weekly", 0.5, "2026-11-02T00:00:00Z")
+	b := NewQuotaBucket(" weekly limit ", 0.5, "2026-11-02T00:00:00Z")
 	if b.Window != "weekly" || b.RemainingFraction != 0.5 || b.ResetTime != "2026-11-02T00:00:00Z" {
 		t.Fatalf("wrong bucket: %+v", b)
 	}

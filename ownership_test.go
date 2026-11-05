@@ -139,6 +139,27 @@ func TestKeyOwnershipCommitPromotesPending(t *testing.T) {
 	}
 }
 
+func TestKeyOwnershipRejectedRotationKeepsOriginalClaim(t *testing.T) {
+	var g KeyOwnership
+	ctx := context.Background()
+	original, occupied := digestOf("original-key"), digestOf("occupied-key")
+	if err := g.Claim(ctx, "a.json", original); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Claim(ctx, "b.json", occupied); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Claim(ctx, "a.json", occupied); err == nil || MapError(err).Code != "duplicate_auth" {
+		t.Fatalf("rotation to occupied key: %v", err)
+	}
+	if err := g.Claim(ctx, "c.json", original); err == nil || MapError(err).Code != "duplicate_auth" {
+		t.Fatalf("rejected rotation freed original claim: %v", err)
+	}
+	if err := g.Claim(ctx, "a.json", original); err != nil {
+		t.Fatalf("original owner lost its claim: %v", err)
+	}
+}
+
 func TestProvisionalParseExpiry(t *testing.T) {
 	if _, ok := ProvisionalParseExpiry(context.Background()); ok {
 		t.Fatal("plain context reported provisional")

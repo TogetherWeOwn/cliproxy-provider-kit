@@ -15,6 +15,10 @@ func TestStripEchoNamespace(t *testing.T) {
 	if got := string(stripEchoNamespace([]byte(`{"model":"echo-model"}`))); !strings.Contains(got, `"echo-model"`) {
 		t.Fatalf("bare id changed: %s", got)
 	}
+	out = stripEchoNamespace([]byte(`{"model":"echo/echo/echo-model"}`))
+	if err := json.Unmarshal(out, &body); err != nil || body["model"] != "echo/echo-model" {
+		t.Fatalf("must strip exactly one namespace: %s", out)
+	}
 }
 
 func TestStripEchoNamespaceKeepsLargeIntegers(t *testing.T) {

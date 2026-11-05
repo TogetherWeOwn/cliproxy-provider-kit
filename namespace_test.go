@@ -28,8 +28,15 @@ func TestNewRejectsMissingModelNamespace(t *testing.T) {
 		"leading slash": "/nvidia",
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, err := New(namespacedDefinition(ns, registrar, registrar), nil); err == nil {
-				t.Fatalf("namespace %q accepted", ns)
+			for _, d := range []Definition{
+				namespacedDefinition(ns, registrar, registrar),
+				namespacedDefinition(ns, registrar, nil),
+				namespacedDefinition(ns, nil, registrar),
+			} {
+				if r, err := New(d, nil); err == nil {
+					r.Shutdown(context.Background())
+					t.Fatalf("namespace %q accepted", ns)
+				}
 			}
 		})
 	}
@@ -86,9 +93,9 @@ func mixedCatalog(ns string) []pluginapi.ModelInfo {
 		return pluginapi.ModelInfo{ID: id, Object: "model", OwnedBy: "test", DisplayName: id}
 	}
 	return []pluginapi.ModelInfo{
+		mk("bare-model"),
 		mk(ns + "/good-model"),
 		mk(ns + "/second/layer"),
-		mk("bare-model"),
 		mk("other-ns/good-model"),
 		mk(ns + "/" + ns + "/doubled"),
 		mk(ns + "/" + ns),
@@ -105,8 +112,12 @@ func TestRegistrationPathsEnforceNamespace(t *testing.T) {
 			{Provider: "test-second", Models: mixedCatalog("nvidia")},
 		},
 	}
-	stub.static = pluginapi.ModelResponse{Provider: "test", Models: mixedCatalog("nvidia")}
-	stub.forAuth = pluginapi.ModelResponse{Provider: "test", Models: mixedCatalog("nvidia")}
+	stub.static = pluginapi.ModelResponse{Provider: "test", Models: mixedCatalog("nvidia"), Registrations: []pluginapi.ProviderModels{{Provider: "test-static", Models: mixedCatalog("nvidia")}}}
+	stub.forAuth = pluginapi.ModelResponse{Provider: "test", Models: mixedCatalog("nvidia"), Registrations: []pluginapi.ProviderModels{{Provider: "test-auth", Models: mixedCatalog("nvidia")}}}
+	originalRegister := modelIDs(stub.register.Models)
+	originalNested := modelIDs(stub.register.Registrations[0].Models)
+	originalStatic := modelIDs(stub.static.Registrations[0].Models)
+	originalForAuth := modelIDs(stub.forAuth.Registrations[0].Models)
 	r := newRuntime(t, namespacedDefinition("nvidia", stub, stub), nil)
 	register(t, r)
 
@@ -119,7 +130,7 @@ func TestRegistrationPathsEnforceNamespace(t *testing.T) {
 		decodeResult(t, env.Result, &reg)
 	}
 	// Filtering must not mutate the provider's own lists.
-	if got := modelIDs(stub.register.Models); len(got) != 7 {
+	if got := modelIDs(stub.register.Models); !equalStrings(got, originalRegister) {
 		t.Fatalf("provider slice mutated: %q", got)
 	}
 	if got := modelIDs(reg.Models); !equalStrings(got, want) {
@@ -134,7 +145,7 @@ func TestRegistrationPathsEnforceNamespace(t *testing.T) {
 	// The provider's cached Registrations entries must keep their originals.
 	// This runs unconditionally so mutation is caught even when filtering
 	// otherwise succeeds.
-	if got := modelIDs(stub.register.Registrations[0].Models); len(got) != 7 {
+	if got := modelIDs(stub.register.Registrations[0].Models); !equalStrings(got, originalNested) {
 		t.Fatalf("provider registrations mutated: %q", got)
 	}
 
@@ -157,6 +168,21 @@ func TestRegistrationPathsEnforceNamespace(t *testing.T) {
 	}
 	if got := modelIDs(dynamic.Models); !equalStrings(got, want) {
 		t.Fatalf("discovered models = %q, want %q", got, want)
+	}
+	for _, tc := range []struct {
+		response pluginapi.ModelResponse
+		original pluginapi.ModelResponse
+		snapshot []string
+	}{
+		{static, stub.static, originalStatic},
+		{dynamic, stub.forAuth, originalForAuth},
+	} {
+		if len(tc.response.Registrations) != 1 || !equalStrings(modelIDs(tc.response.Registrations[0].Models), want) {
+			t.Fatalf("nested models were not filtered: %+v", tc.response.Registrations)
+		}
+		if got := modelIDs(tc.original.Registrations[0].Models); !equalStrings(got, tc.snapshot) {
+			t.Fatalf("nested models were mutated: %q, want %q", got, tc.snapshot)
+		}
 	}
 }
 

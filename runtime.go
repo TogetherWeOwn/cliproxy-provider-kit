@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 
@@ -116,6 +117,11 @@ func New(d Definition, h Caller) (*Runtime, error) {
 	// single identifier, so extra identifiers would be silently dropped.
 	if _, multi := c.AuthProvider.(pluginapi.MultiAuthProvider); multi || len(c.AuthProviders) > 0 {
 		return nil, fmt.Errorf("multiple auth providers are not supported; use a single AuthProvider")
+	}
+	if c.ManagementAPI != nil {
+		if _, ok := c.ManagementAPI.(pluginapi.ManagementHandler); !ok {
+			return nil, fmt.Errorf("management API requires a ManagementHandler for RPC dispatch")
+		}
 	}
 	root, cancel := context.WithCancel(context.Background())
 	return &Runtime{def: d, host: h, root: root, cancel: cancel}, nil
@@ -451,7 +457,23 @@ func (r *Runtime) dispatch(ctx context.Context, m string, raw []byte, finish fun
 		}
 	case pluginabi.MethodManagementRegister:
 		if c.ManagementAPI != nil {
-			result, err = invoke(ctx, raw, c.ManagementAPI.RegisterManagement)
+			result, err = invoke(ctx, raw, func(ctx context.Context, q pluginapi.ManagementRegistrationRequest) (pluginapi.ManagementRegistrationResponse, error) {
+				resp, err := c.ManagementAPI.RegisterManagement(ctx, q)
+				if err != nil {
+					return resp, err
+				}
+				// The host installs its RPC adapter after decoding these routes.
+				// Process-local interfaces cannot cross that JSON boundary.
+				resp.Routes = slices.Clone(resp.Routes)
+				for i := range resp.Routes {
+					resp.Routes[i].Handler = nil
+				}
+				resp.Resources = slices.Clone(resp.Resources)
+				for i := range resp.Resources {
+					resp.Resources[i].Handler = nil
+				}
+				return resp, nil
+			})
 			return result, false, err
 		}
 	case pluginabi.MethodManagementHandle:

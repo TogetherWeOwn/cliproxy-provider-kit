@@ -74,6 +74,13 @@ func TestPackedUpstreamThroughRealHandlers(t *testing.T) {
 				_, _ = w.Write([]byte(write))
 				w.(http.Flusher).Flush()
 			}
+			// A terminal SSE event must finish the real host response without
+			// waiting for HTTP EOF, and cancel the still-open upstream body.
+			select {
+			case <-r.Context().Done():
+			case <-time.After(5 * time.Second):
+				t.Error("host did not release the upstream after [DONE]")
+			}
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
