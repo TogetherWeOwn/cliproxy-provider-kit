@@ -191,11 +191,59 @@ type ownershipExtensionsAuth struct {
 func (p ownershipExtensionsAuth) CredentialProviders() []string { return p.creds }
 
 func TestAuthIdentifierForwardsOwnershipExtensions(t *testing.T) {
-	p := ownershipExtensionsAuth{
-		APIKeyAuth: APIKeyAuth{Provider: "meta-muse"},
-		creds:      []string{"meta"},
+	for _, tc := range []struct {
+		name  string
+		creds []string
+		want  string
+	}{
+		{"legacy provider", []string{"legacy-echo"}, `["legacy-echo"]`},
+		{"nil", nil, `null`},
+		{"empty", []string{}, `[]`},
+		// Ownership normalization and conflict policy belong to the host.
+		{"verbatim", []string{" legacy-echo ", "", "legacy-echo", "例"}, `[" legacy-echo ","","legacy-echo","例"]`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := ownershipExtensionsAuth{APIKeyAuth: APIKeyAuth{Provider: "echo"}, creds: tc.creds}
+			r := newRuntime(t, Definition{Metadata: metadata(), Capabilities: pluginapi.Capabilities{AuthProvider: p}}, nil)
+			register(t, r)
+			env := rpc(t, r, "auth.identifier", map[string]any{})
+			if !env.OK {
+				t.Fatal(env.Error)
+			}
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(env.Result, &fields); err != nil {
+				t.Fatal(err)
+			}
+			if len(fields) != 2 || string(fields["identifier"]) != `"echo"` || string(fields["credential_providers"]) != tc.want {
+				t.Fatalf("unexpected ownership response %s", env.Result)
+			}
+		})
 	}
-	r := newRuntime(t, Definition{Metadata: metadata(), Capabilities: pluginapi.Capabilities{AuthProvider: p}}, nil)
+}
+
+type multiIdentifierAuth struct{ ownershipExtensionsAuth }
+
+func (multiIdentifierAuth) Identifiers() []string { return []string{"echo", "legacy-echo"} }
+
+func TestAuthIdentifierStillRejectsMultiAuth(t *testing.T) {
+	p := ownershipExtensionsAuth{APIKeyAuth: APIKeyAuth{Provider: "echo"}, creds: []string{"legacy-echo"}}
+	for _, c := range []pluginapi.Capabilities{
+		{AuthProvider: multiIdentifierAuth{p}},
+		{AuthProviders: []pluginapi.AuthProvider{p}},
+	} {
+		r, err := New(Definition{Metadata: metadata(), Capabilities: c}, nil)
+		if err == nil {
+			r.Shutdown(context.Background())
+			t.Fatal("credential ownership extension enabled multi-auth registration")
+		}
+		if !strings.Contains(err.Error(), "multiple auth providers are not supported") {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestAuthIdentifierOmitsAbsentExtensions(t *testing.T) {
+	r := newRuntime(t, Definition{Metadata: metadata(), Capabilities: pluginapi.Capabilities{AuthProvider: APIKeyAuth{Provider: "echo"}}}, nil)
 	register(t, r)
 	env := rpc(t, r, "auth.identifier", map[string]any{})
 	if !env.OK {
@@ -205,46 +253,40 @@ func TestAuthIdentifierForwardsOwnershipExtensions(t *testing.T) {
 	if err := json.Unmarshal(env.Result, &fields); err != nil {
 		t.Fatal(err)
 	}
-	if string(fields["identifier"]) != `"meta-muse"` {
-		t.Fatalf("identifier %s", env.Result)
-	}
-	if string(fields["credential_providers"]) != `["meta"]` {
-		t.Fatalf("credential_providers %s", env.Result)
-	}
-}
-
-type multiIdentifierAuth struct {
-	APIKeyAuth
-	ids []string
-}
-
-func (p multiIdentifierAuth) Identifiers() []string { return p.ids }
-
-func TestAuthIdentifierResponseForwardsMultiIdentifiers(t *testing.T) {
-	resp := authIdentifierResponse(multiIdentifierAuth{APIKeyAuth: APIKeyAuth{Provider: "echo"}, ids: []string{"echo", "legacy-echo"}})
-	raw, err := json.Marshal(resp)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &fields); err != nil {
-		t.Fatal(err)
-	}
-	if string(fields["identifier"]) != `"echo"` || string(fields["identifiers"]) != `["echo","legacy-echo"]` {
-		t.Fatalf("identifiers %s", raw)
-	}
-}
-
-func TestAuthIdentifierOmitsAbsentExtensions(t *testing.T) {
-	raw, err := json.Marshal(authIdentifierResponse(APIKeyAuth{Provider: "echo"}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &fields); err != nil {
-		t.Fatal(err)
-	}
 	if len(fields) != 1 || string(fields["identifier"]) != `"echo"` {
-		t.Fatalf("unexpected fields %s", raw)
+		t.Fatalf("unexpected fields %s", env.Result)
+	}
+}
+
+func TestAuthIdentifierWithoutAuthProvider(t *testing.T) {
+	// API-key-only definitions may leave AuthProvider unset for the host's
+	// generic auth-file path. Forwarding must not enable that capability.
+	r := newRuntime(t, Definition{Metadata: metadata()}, nil)
+	env := rpc(t, r, "plugin.register", map[string]any{"schema_version": 10})
+	if !env.OK {
+		t.Fatal(env.Error)
+	}
+	var reg registration
+	if err := json.Unmarshal(env.Result, &reg); err != nil {
+		t.Fatal(err)
+	}
+	if reg.Capabilities.Auth {
+		t.Fatal("advertised absent auth provider")
+	}
+	if env := rpc(t, r, "auth.identifier", map[string]any{}); env.OK || env.Error == nil || env.Error.Code != "unknown_method" {
+		t.Fatalf("dispatched absent auth provider: %+v", env)
+	}
+}
+
+type panickingOwnershipAuth struct{ APIKeyAuth }
+
+func (panickingOwnershipAuth) CredentialProviders() []string { panic("private-ownership-detail") }
+
+func TestAuthIdentifierExtensionPanicRedacted(t *testing.T) {
+	r := newRuntime(t, Definition{Metadata: metadata(), Capabilities: pluginapi.Capabilities{AuthProvider: panickingOwnershipAuth{APIKeyAuth{Provider: "echo"}}}}, nil)
+	register(t, r)
+	env := rpc(t, r, "auth.identifier", map[string]any{})
+	if env.OK || env.Error == nil || env.Error.Code != "plugin_panic" || strings.Contains(env.Error.Message, "private-ownership-detail") || len(env.Result) != 0 {
+		t.Fatalf("ownership panic not contained: %+v", env)
 	}
 }

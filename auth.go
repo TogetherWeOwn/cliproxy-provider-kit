@@ -37,16 +37,11 @@ type credentialProviderSource interface {
 	CredentialProviders() []string
 }
 
-// authIdentifierResponse builds the auth.identifier result, forwarding the
-// optional MultiAuthProvider and CredentialProviders extensions the host
-// already parses. Without forwarding, extra identifiers would be silently
-// dropped while the host assumes full ownership data.
+// authIdentifierResponse preserves optional credential ownership metadata for
+// the host to interpret. New still rejects MultiAuthProvider registrations.
 func authIdentifierResponse(p pluginapi.AuthProvider) map[string]any {
 	resp := map[string]any{"identifier": p.Identifier()}
-	if multi, ok := p.(pluginapi.MultiAuthProvider); ok && multi != nil {
-		resp["identifiers"] = multi.Identifiers()
-	}
-	if creds, ok := p.(credentialProviderSource); ok && creds != nil {
+	if creds, ok := p.(credentialProviderSource); ok {
 		resp["credential_providers"] = creds.CredentialProviders()
 	}
 	return resp
