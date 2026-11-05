@@ -26,6 +26,9 @@ func TestPrefixClaimsRejectSharedPrefix(t *testing.T) {
 	if err := claims.Claim("c.json", "acct-a", []byte("key-three")); MapError(err).Code != "duplicate_prefix" {
 		t.Fatalf("rejected claim evicted the owner: %v", err)
 	}
+	if err := claims.Claim("a.json", "acct-a", []byte("key-one")); err != nil {
+		t.Fatalf("rejected claim replaced the owner: %v", err)
+	}
 }
 
 func TestPrefixClaimsWhitespaceInsideSlashes(t *testing.T) {
@@ -187,6 +190,86 @@ func TestQuotaObservationRequiresMatchingContext(t *testing.T) {
 	}
 }
 
+type quotaWaitContext struct {
+	context.Context
+	waiting chan struct{}
+}
+
+func (c quotaWaitContext) Done() <-chan struct{} {
+	close(c.waiting)
+	return c.Context.Done()
+}
+
+func TestQuotaObservationDuringCredentialMismatchPoll(t *testing.T) {
+	for _, observation := range []string{"matching", "unbound", "different", "expired"} {
+		for _, pollFails := range []bool{false, true} {
+			t.Run(observation+map[bool]string{false: "/success", true: "/error"}[pollFails], func(t *testing.T) {
+				started, release := make(chan struct{}), make(chan struct{})
+				q := NewCachedQuota("echo", "Echo", func(context.Context, pluginapi.QuotaFetchRequest) (pluginapi.QuotaFetchResponse, error) {
+					close(started)
+					<-release
+					if pollFails {
+						return pluginapi.QuotaFetchResponse{}, rpcError("poll_failed", "poll failed", 500)
+					}
+					return quotaFixture(.5), nil
+				})
+				now := time.Unix(1000, 0)
+				q.now = func() time.Time { return now }
+				old := pluginapi.QuotaFetchRequest{AuthID: "a", Provider: "echo", StorageJSON: []byte(`{"api_key":"old-key"}`)}
+				req := old
+				req.StorageJSON = []byte(`{"api_key":"new-key"}`)
+				if err := q.Store(old, quotaFixture(.1)); err != nil {
+					t.Fatal(err)
+				}
+				type result struct {
+					response pluginapi.QuotaFetchResponse
+					err      error
+				}
+				done := make(chan result, 2)
+				fetch := func(ctx context.Context) {
+					resp, err := q.FetchQuota(ctx, req)
+					done <- result{resp, err}
+				}
+				go fetch(context.Background())
+				<-started
+				waiting := make(chan struct{})
+				go fetch(quotaWaitContext{context.Background(), waiting})
+				<-waiting
+				stored := req
+				switch observation {
+				case "unbound":
+					stored.StorageJSON = nil
+				case "different":
+					stored = old
+				}
+				if err := q.Store(stored, quotaFixture(.9)); err != nil {
+					t.Fatal(err)
+				}
+				if observation == "expired" {
+					now = now.Add(QuotaCacheTTL)
+				}
+				close(release)
+				for i := 0; i < 2; i++ {
+					got := <-done
+					if observation == "different" || observation == "expired" {
+						if pollFails {
+							if got.err == nil || MapError(got.err).Code != "poll_failed" {
+								t.Fatalf("poll error lost: %+v", got)
+							}
+							continue
+						}
+						if got.err != nil || got.response.Groups[0].Buckets[0].RemainingFraction != .5 {
+							t.Fatalf("ineligible observation served: %+v", got)
+						}
+					} else if got.err != nil || got.response.Groups[0].Buckets[0].RemainingFraction != .9 {
+						t.Fatalf("fresh observation lost to older poll: %+v", got)
+					}
+				}
+			})
+		}
+	}
+}
+
 func TestQuotaObservationBoundToCredential(t *testing.T) {
 	var calls int
 	q := NewCachedQuota("echo", "Echo", func(context.Context, pluginapi.QuotaFetchRequest) (pluginapi.QuotaFetchResponse, error) {
@@ -205,6 +288,12 @@ func TestQuotaObservationBoundToCredential(t *testing.T) {
 	// … but never a rotated credential under the same identity: poll fresh.
 	if resp, err := q.FetchQuota(context.Background(), newReq); err != nil || resp.Groups[0].Buckets[0].RemainingFraction != .5 || calls != 1 {
 		t.Fatalf("stale generation served: %+v calls %d %v", resp, calls, err)
+	}
+	// Metadata-only credential rotation must not reuse a storage-bound header.
+	metadataReq := oldReq
+	metadataReq.Metadata = map[string]any{"api_key": "new-key"}
+	if resp, err := q.FetchQuota(context.Background(), metadataReq); err != nil || resp.Groups[0].Buckets[0].RemainingFraction != .5 || calls != 2 {
+		t.Fatalf("metadata rotation served stale observation: %+v calls %d %v", resp, calls, err)
 	}
 	// Unbound (header-only, unknown credential) observations keep the fast path.
 	q2 := NewCachedQuota("echo", "Echo", func(context.Context, pluginapi.QuotaFetchRequest) (pluginapi.QuotaFetchResponse, error) {

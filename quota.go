@@ -158,7 +158,7 @@ func (q *CachedQuota) FetchQuota(ctx context.Context, r pluginapi.QuotaFetchRequ
 		case <-ctx.Done():
 			return pluginapi.QuotaFetchResponse{}, ctx.Err()
 		case <-e.ready:
-			return decodeQuota(e)
+			return q.completedQuota(key, e)
 		}
 	}
 	e := &quotaEntry{ready: make(chan struct{})}
@@ -192,7 +192,18 @@ func (q *CachedQuota) FetchQuota(ctx context.Context, r pluginapi.QuotaFetchRequ
 	}
 	close(e.ready)
 	q.mu.Unlock()
-	return decodeQuota(e)
+	return q.completedQuota(key, e)
+}
+
+// completedQuota prefers an eligible observation received while a poll ran,
+// for both the poll owner and its waiters. Entries are immutable once ready.
+func (q *CachedQuota) completedQuota(key quotaKey, polled *quotaEntry) (pluginapi.QuotaFetchResponse, error) {
+	q.mu.Lock()
+	if observed := q.observations[key.AuthID]; observed != nil && q.now().Before(observed.expires) && (!observed.hasCred || observed.cred == key.Credentials) {
+		polled = observed
+	}
+	q.mu.Unlock()
+	return decodeQuota(polled)
 }
 
 // Store replaces an auth-identity observation (for example, from a provider

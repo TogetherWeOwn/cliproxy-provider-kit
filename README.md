@@ -42,7 +42,8 @@ func init() {
                 // flow (StartLogin/PollLogin fail with api_key_only), so a
                 // registered provider would advertise a login card that can
                 // only fail. Auth files load through the host's generic file
-                // path instead.
+                // path instead; it does not call APIKeyAuth.ParseAuth or
+                // Validate. Check provider-specific fields in the executor.
                 // Add ModelRegistrar / ModelProvider, Executor, QuotaProvider,
                 // and optionally UsagePlugin implemented by your provider.
             },
@@ -99,8 +100,10 @@ own.
 | `ValidateMetadata(pluginapi.Metadata) error` | Require nonempty Name/Version/Author/GitHubRepository and an HTTPS GitHub owner/repository URL. |
 | `ModelNamespace` (`Definition` field) + `ValidateModelNamespace(string) error` | Fixed vendor namespace for every registered/served model id; required when model capabilities are set, enforced on all three model paths. |
 | `CheckModelNamespace(ns, models) error` / `AssertModelNamespace(t, ns, models)` | Reusable conformance check for plugin test suites: every emitted id must carry `ns` exactly once. |
-| `APIKeyAuth` | Stateless SDK `AuthProvider`; top-level type dispatch, validation, stable IDs, API-key-only login errors, no-op refresh. Optional `Validate` checks provider fields. There is no login flow: `StartLogin`/`PollLogin` always fail with `api_key_only`. API-key providers must omit `AuthProvider` from their capabilities (no login card is shown) and let auth files load through the host's generic file path; registering `APIKeyAuth` would advertise a login card that can only fail. |
+| `APIKeyAuth` | Stateless SDK `AuthProvider`; top-level type dispatch, validation, stable IDs, API-key-only login errors, no-op refresh. Optional `Validate` checks provider fields only when `ParseAuth` is actually called; the generic file path calls neither method, so validate provider-specific fields in the executor. There is no login flow: `StartLogin`/`PollLogin` always fail with `api_key_only`. API-key providers must omit `AuthProvider` from their capabilities (no login card is shown) and let auth files load through the host's generic file path; registering `APIKeyAuth` would advertise a login card that can only fail. |
 | `KeyOwnership` / `ProvisionalParseExpiry(ctx)` | Shared filename-ownership duplicate guard keyed by a caller-computed credential-identity digest (key alone, or a composite such as account plus key when keys are shared across accounts). Host parses of real auth files commit ownership. The provisional marker (`withProvisionalParse`) is internal: providers on the generic file path have no pre-save validation flow, so an abandoned validation cannot hold a key. Hand-rolled guards consult `ProvisionalParseExpiry` for the same commit/reserve split. |
+| `PrefixClaims.Claim(file, prefix, credential)` / `Release(file)` | Opt-in provider-owned collision tracker, not automatic host enforcement. Claim immediately replaces that file's previous claim; serialize it with committed auth changes, not speculative parses that the host may discard. Release only when the old auth is no longer active. |
+| `NormalizePrefix(prefix) (string, error)` | Canonicalize a direct caller's prefix before both Claim and returning the auth to the host; Claim's internal comparison normalization cannot rewrite the caller's auth. `APIKeyAuth.ParseAuth` already returns this canonical prefix. |
 | `AuthFields(storage, metadata)` / `APIKey(storage, metadata)` | Decode object storage with host-compatible metadata precedence; never include credential values in errors. |
 | `Passthrough` | SDK executor using **only** the injected `HostHTTPClient`. Supply `BuildRequest`; optionally `PrepareHTTP`, `ClassifyError`, and `TokenCount`. `ExecuteStream` re-frames SSE upstreams (`text/event-stream`, or a missing Content-Type) for OpenAI-protocol plugin output into one host chunk per data event (comments/`[DONE]` dropped) and forwards anything else unchanged — other Content-Types so the host frames them, non-OpenAI output so translators and native host paths keep complete framed SSE; callers must not frame again. |
 | `MapError(error) *pluginabi.Error` | Preserve explicit code/status/retry fields; redact unclassified errors. |

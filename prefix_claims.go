@@ -10,17 +10,19 @@ import (
 // two credentials cannot silently share one pinning namespace (G-K1). The
 // host strips a credential's prefix before upstream dispatch, so two accounts
 // sharing a prefix merge into one namespace and defeat per-account pinning.
-// APIKeyAuth stays stateless by design; providers that parse multiple auth
-// files embed this tracker and fail ParseAuth loudly on collision instead.
+// APIKeyAuth stays stateless by design; providers own this optional tracker
+// and the lifecycle that applies or removes their auths. Claim is an immediate
+// update, not a reservation tied to a host parse/install transaction. Providers
+// must serialize claims with committed auth changes; speculative ParseAuth
+// calls alone cannot guarantee uniqueness among installed host auths.
 //
-// Only non-empty, slash-free prefixes are claimed. On the plugin path the host
-// pins the plugin-returned prefix verbatim (TrimSpace only), so unlike the
-// built-in filestore path it does not normalize slashes away: APIKeyAuth
-// normalizes like the filestore (see normalizePrefix) at parse, and Claim
-// enforces the same contract for direct callers. Empty prefixes are the
-// normal unpinned state shared by any number of files. Credential identity is
-// the SHA-256 of the provider's credential bytes (for example the trimmed API
-// key); only digests are retained, never key material.
+// Only non-empty, slash-free prefixes are claimed. The host pins the returned
+// prefix verbatim (TrimSpace only). Use APIKeyAuth's parsed Prefix, or call
+// NormalizePrefix and use its result both for Claim and the returned auth.
+// Claim normalizes for comparison but cannot rewrite a caller's auth value.
+// Empty prefixes are the normal unpinned state shared by any number of files.
+// Credential identity is the SHA-256 of the provider's credential bytes (for
+// example the trimmed API key); only digests are retained, never key material.
 type PrefixClaims struct {
 	mu       sync.Mutex
 	byPrefix map[string]prefixClaim
@@ -37,13 +39,13 @@ type fileClaim struct {
 	digest [32]byte
 }
 
-// normalizePrefix applies the host filestore's prefix contract to a
+// NormalizePrefix applies the host filestore's prefix contract to a
 // plugin-returned prefix: surrounding whitespace and "/" are trimmed, and an
 // inner "/" is rejected with invalid_auth. The plugin path pins whatever the
 // plugin returns verbatim, so silently mapping a slashed prefix to unpinned
 // would leave two files sharing one host namespace while the tracker believes
 // both are unpinned. The programme rule is never to silently drop: reject.
-func normalizePrefix(prefix string) (string, error) {
+func NormalizePrefix(prefix string) (string, error) {
 	prefix = strings.TrimSpace(strings.Trim(strings.TrimSpace(prefix), "/"))
 	if strings.Contains(prefix, "/") {
 		return "", rpcError("invalid_auth", "prefix must not contain \"/\"", 400)
@@ -61,7 +63,7 @@ func normalizePrefix(prefix string) (string, error) {
 // be treated as unpinned.
 func (t *PrefixClaims) Claim(file, prefix string, credential []byte) error {
 	var err error
-	if prefix, err = normalizePrefix(prefix); err != nil {
+	if prefix, err = NormalizePrefix(prefix); err != nil {
 		return err
 	}
 	digest := sha256.Sum256(credential)
@@ -96,9 +98,9 @@ func (t *PrefixClaims) Claim(file, prefix string, credential []byte) error {
 	return nil
 }
 
-// Release forgets every claim held by file. Providers call it when an auth
-// file is deleted or becomes unparsable so a removed file cannot squat on a
-// prefix or mask a genuine duplicate.
+// Release forgets every claim held by file. Providers call it after an auth
+// has been removed from active use, not merely when a speculative parse fails,
+// so a removed auth cannot squat on a prefix or mask a genuine duplicate.
 func (t *PrefixClaims) Release(file string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()

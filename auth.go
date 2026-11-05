@@ -152,8 +152,12 @@ func (p APIKeyAuth) ParseAuth(_ context.Context, req pluginapi.AuthParseRequest)
 	// pins whatever ParseAuth returns verbatim, so a slashed prefix must be
 	// rejected here rather than silently treated as unpinned downstream.
 	// The normalized value is written back so SDK metadata agrees with Prefix.
-	if _, exists := fields["prefix"]; exists {
-		normalized, err := normalizePrefix(fields["prefix"].(string))
+	if value, exists := fields["prefix"]; exists {
+		prefix, ok := value.(string)
+		if !ok {
+			return pluginapi.AuthParseResponse{}, rpcError("invalid_auth", "host auth text fields must be strings", 400)
+		}
+		normalized, err := NormalizePrefix(prefix)
 		if err != nil {
 			return pluginapi.AuthParseResponse{}, err
 		}
