@@ -19,12 +19,12 @@ const maxStreamEventBytes = 8 << 20
 type streamFraming struct {
 	bare     bool // OpenAI chat handlers add their own data: prefix
 	native   bool // native handlers write complete, named SSE events verbatim
-	dropDone bool // the OpenAI host appends its own terminator
+	dropDone bool // stop at [DONE]; the OpenAI host appends its own terminator
 }
 
 // frameStreamChunks implements the OpenAI-output chunk contract: bare JSON for
 // chat/completions clients, one data:-framed event per translator call otherwise.
-// Comments and [DONE] are dropped. onExit releases the upstream on completion,
+// Comments are dropped; [DONE] ends the stream. onExit releases the upstream on completion,
 // cancellation or framing error, including when the forwarder is blocked sending.
 func frameStreamChunks(ctx context.Context, in <-chan pluginapi.ExecutorStreamChunk, bare bool, onExit func()) <-chan pluginapi.ExecutorStreamChunk {
 	return frameSSEChunks(ctx, in, streamFraming{bare: bare, dropDone: true}, onExit)
@@ -72,7 +72,7 @@ func frameSSEChunks(ctx context.Context, in <-chan pluginapi.ExecutorStreamChunk
 			payload := string(event[:len(event)-1])
 			event = event[:0]
 			if framing.dropDone && strings.TrimSpace(payload) == "[DONE]" {
-				return nil
+				return errStreamComplete
 			}
 			// Translators read one JSON value per call, not an SSE document.
 			if strings.Contains(payload, "\n") {
@@ -220,7 +220,7 @@ func frameSSEChunks(ctx context.Context, in <-chan pluginapi.ExecutorStreamChunk
 				}
 			}
 		}
-		if err := run(); err != nil && err != errStreamConsumerGone {
+		if err := run(); err != nil && err != errStreamConsumerGone && err != errStreamComplete {
 			_ = send(pluginapi.ExecutorStreamChunk{Err: err})
 		}
 	}()
@@ -228,6 +228,7 @@ func frameSSEChunks(ctx context.Context, in <-chan pluginapi.ExecutorStreamChunk
 }
 
 var (
+	errStreamComplete      = errors.New("stream complete")
 	errStreamConsumerGone  = errors.New("stream consumer gone")
 	errStreamEventTooLarge = invalidStreamChunk("invalid_stream: upstream event exceeds 8 MiB")
 )

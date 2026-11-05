@@ -110,6 +110,9 @@ func TestNativeSSEAndManagementThroughPinnedHost(t *testing.T) {
 							if !strings.Contains(wire.String(), "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n") {
 								t.Fatal("native route lost complete named SSE events")
 							}
+							if !strings.Contains(wire.String(), ": heartbeat\n\n") {
+								t.Fatal("native route lost upstream heartbeat")
+							}
 							if !strings.Contains(wire.String(), "id: 17\nretry: 2000\n\n") {
 								t.Fatal("native route lost metadata-only SSE events")
 							}

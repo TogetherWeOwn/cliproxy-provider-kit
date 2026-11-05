@@ -55,8 +55,8 @@ func streamRPC(t *testing.T, err error) *pluginabi.Error {
 }
 
 // Several events and a comment in one write, a frame split across writes,
-// CRLF line ends, a multi-line data field, [DONE], and a final frame with no
-// blank line.
+// CRLF line ends, a multi-line data field, [DONE], and trailing data which must
+// not be forwarded after the terminal event.
 var packedUpstream = []string{
 	": upstream comment\n\ndata: {\"a\":1}\n\ndata: {\"b\"",
 	":2}\r\n\r\n: upstream comment\r\n\r\ndata: {\"c\":\n",
@@ -69,7 +69,7 @@ func TestFrameStreamChunksBareForOpenAIChat(t *testing.T) {
 		chunks = append(chunks, streamBytes(s))
 	}
 	got, errs := collectStream(t, frameStreamChunks(context.Background(), streamFeed(chunks...), true, nil))
-	want := []string{`{"a":1}`, `{"b":2}`, `{"c":3}`, `{"d":4}`, `{"e":5}`}
+	want := []string{`{"a":1}`, `{"b":2}`, `{"c":3}`, `{"d":4}`}
 	if len(errs) != 0 || !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %q errs %v", got, errs)
 	}
@@ -81,7 +81,7 @@ func TestFrameStreamChunksDataFramedForTranslatedRoutes(t *testing.T) {
 		chunks = append(chunks, streamBytes(s))
 	}
 	got, _ := collectStream(t, frameStreamChunks(context.Background(), streamFeed(chunks...), false, nil))
-	want := []string{`data: {"a":1}`, `data: {"b":2}`, `data: {"c":3}`, `data: {"d":4}`, `data: {"e":5}`}
+	want := []string{`data: {"a":1}`, `data: {"b":2}`, `data: {"c":3}`, `data: {"d":4}`}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %q", got)
 	}
