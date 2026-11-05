@@ -28,8 +28,15 @@ func TestNewRejectsMissingModelNamespace(t *testing.T) {
 		"leading slash": "/nvidia",
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, err := New(namespacedDefinition(ns, registrar, registrar), nil); err == nil {
-				t.Fatalf("namespace %q accepted", ns)
+			for _, d := range []Definition{
+				namespacedDefinition(ns, registrar, registrar),
+				namespacedDefinition(ns, registrar, nil),
+				namespacedDefinition(ns, nil, registrar),
+			} {
+				if r, err := New(d, nil); err == nil {
+					r.Shutdown(context.Background())
+					t.Fatalf("namespace %q accepted", ns)
+				}
 			}
 		})
 	}
@@ -105,8 +112,8 @@ func TestRegistrationPathsEnforceNamespace(t *testing.T) {
 			{Provider: "test-second", Models: mixedCatalog("nvidia")},
 		},
 	}
-	stub.static = pluginapi.ModelResponse{Provider: "test", Models: mixedCatalog("nvidia")}
-	stub.forAuth = pluginapi.ModelResponse{Provider: "test", Models: mixedCatalog("nvidia")}
+	stub.static = pluginapi.ModelResponse{Provider: "test", Models: mixedCatalog("nvidia"), Registrations: []pluginapi.ProviderModels{{Provider: "test-static", Models: mixedCatalog("nvidia")}}}
+	stub.forAuth = pluginapi.ModelResponse{Provider: "test", Models: mixedCatalog("nvidia"), Registrations: []pluginapi.ProviderModels{{Provider: "test-auth", Models: mixedCatalog("nvidia")}}}
 	r := newRuntime(t, namespacedDefinition("nvidia", stub, stub), nil)
 	register(t, r)
 
@@ -157,6 +164,20 @@ func TestRegistrationPathsEnforceNamespace(t *testing.T) {
 	}
 	if got := modelIDs(dynamic.Models); !equalStrings(got, want) {
 		t.Fatalf("discovered models = %q, want %q", got, want)
+	}
+	for _, tc := range []struct {
+		response pluginapi.ModelResponse
+		original pluginapi.ModelResponse
+	}{
+		{static, stub.static},
+		{dynamic, stub.forAuth},
+	} {
+		if len(tc.response.Registrations) != 1 || !equalStrings(modelIDs(tc.response.Registrations[0].Models), want) {
+			t.Fatalf("nested models were not filtered: %+v", tc.response.Registrations)
+		}
+		if len(tc.original.Registrations[0].Models) != 7 {
+			t.Fatal("nested filtering mutated provider-owned models")
+		}
 	}
 }
 

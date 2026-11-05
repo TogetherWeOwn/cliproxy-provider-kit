@@ -303,13 +303,12 @@ func TestPassthroughNonSSEPassesThrough(t *testing.T) {
 	}
 }
 
-// A non-OpenAI plugin output is forwarded byte-identical even on a chat
-// route: translators and native host paths need complete framed SSE.
-func TestPassthroughNonOpenAIOutputForwardsRaw(t *testing.T) {
+// Native non-OpenAI clients retain event names and complete SSE framing.
+func TestPassthroughNonOpenAINativeOutputKeepsEventName(t *testing.T) {
 	raw := "event: content_block_delta\ndata: {\"a\":1}\n\n"
 	h := &localHostHTTP{status: 200, headers: http.Header{"Content-Type": {"text/event-stream"}}, chunks: []pluginapi.HTTPStreamChunk{{Payload: []byte(raw)}}}
 	p := echoExecutor()
-	resp, err := p.ExecuteStream(context.Background(), pluginapi.ExecutorRequest{Format: "claude", Metadata: map[string]any{"request_path": "/v1/chat/completions"}, HTTPClient: h})
+	resp, err := p.ExecuteStream(context.Background(), pluginapi.ExecutorRequest{Format: "claude", Metadata: map[string]any{"request_path": "/v1/messages"}, HTTPClient: h})
 	if err != nil {
 		t.Fatal(err)
 	}
