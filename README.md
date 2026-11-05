@@ -117,6 +117,8 @@ own.
 
 `Definition.Capabilities` supports auth, model registration, model discovery, executor, quota, usage and management. A `ManagementAPI` must also implement `ManagementHandler` to dispatch RPC route calls. Registration serializes route metadata, not process-local handlers; the host installs its own RPC handler for each declared management route and resource. Other SDK capabilities are rejected rather than advertised without handlers, including the schema 10 multi-auth forms (`Capabilities.AuthProviders`, or an `AuthProvider` implementing `MultiAuthProvider`): the kit exposes one auth identifier per plugin. Executor definitions must declare input/output formats and may set scope `both`, `static`, or `oauth` (default `both`). Let the host translate protocols to those formats; the passthrough helper does not translate or rewrite business payloads after host payload rules.
 
+A registered `AuthProvider` may additionally implement `CredentialProviders() []string` to advertise credential-provider ownership through the `credential_providers` field of `auth.identifier`. The kit forwards those values verbatim; the pinned host interprets and normalizes them. These are ownership claims, not extra login identifiers or a guarantee that the host will install or select the plugin. Providers must claim only credential types they are intended to own. Providers without the extension still return only `identifier`; definitions without an `AuthProvider` remain without that capability.
+
 ### Auth files and persistence
 
 One object per account, using the provider key as top-level `type`:

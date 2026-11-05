@@ -133,6 +133,9 @@ func TestRealHostLoader(t *testing.T) {
 	if !host.HasAuthProvider("echo") || !host.HasQuotaProvider("echo") {
 		t.Fatal("capabilities missing")
 	}
+	if host.HasAuthProvider("legacy-echo") || host.SameAuthProvider("echo", "legacy-echo") {
+		t.Fatal("plain provider acquired undeclared credential ownership")
+	}
 	infos := host.RegisteredPlugins()
 	if len(infos) != 1 || infos[0].Metadata.Version != "0.1.0" || !infos[0].SupportsQuota {
 		t.Fatalf("registration: %+v", infos)

@@ -233,3 +233,111 @@ func TestAuthRefreshKeepsHostStateAndIsolatesStorage(t *testing.T) {
 		t.Fatalf("refreshed storage aliases the request: %s", a.StorageJSON)
 	}
 }
+
+type ownershipExtensionsAuth struct {
+	APIKeyAuth
+	creds []string
+}
+
+func (p ownershipExtensionsAuth) CredentialProviders() []string { return p.creds }
+
+func TestAuthIdentifierForwardsOwnershipExtensions(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		creds []string
+		want  string
+	}{
+		{"legacy provider", []string{"legacy-echo"}, `["legacy-echo"]`},
+		{"nil", nil, `null`},
+		{"empty", []string{}, `[]`},
+		// Ownership normalization and conflict policy belong to the host.
+		{"verbatim", []string{" legacy-echo ", "", "legacy-echo", "例"}, `[" legacy-echo ","","legacy-echo","例"]`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := ownershipExtensionsAuth{APIKeyAuth: APIKeyAuth{Provider: "echo"}, creds: tc.creds}
+			r := newRuntime(t, Definition{Metadata: metadata(), Capabilities: pluginapi.Capabilities{AuthProvider: p}}, nil)
+			register(t, r)
+			env := rpc(t, r, "auth.identifier", map[string]any{})
+			if !env.OK {
+				t.Fatal(env.Error)
+			}
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(env.Result, &fields); err != nil {
+				t.Fatal(err)
+			}
+			if len(fields) != 2 || string(fields["identifier"]) != `"echo"` || string(fields["credential_providers"]) != tc.want {
+				t.Fatalf("unexpected ownership response %s", env.Result)
+			}
+		})
+	}
+}
+
+type multiIdentifierAuth struct{ ownershipExtensionsAuth }
+
+func (multiIdentifierAuth) Identifiers() []string { return []string{"echo", "legacy-echo"} }
+
+func TestAuthIdentifierStillRejectsMultiAuth(t *testing.T) {
+	p := ownershipExtensionsAuth{APIKeyAuth: APIKeyAuth{Provider: "echo"}, creds: []string{"legacy-echo"}}
+	for _, c := range []pluginapi.Capabilities{
+		{AuthProvider: multiIdentifierAuth{p}},
+		{AuthProviders: []pluginapi.AuthProvider{p}},
+	} {
+		r, err := New(Definition{Metadata: metadata(), Capabilities: c}, nil)
+		if err == nil {
+			r.Shutdown(context.Background())
+			t.Fatal("credential ownership extension enabled multi-auth registration")
+		}
+		if !strings.Contains(err.Error(), "multiple auth providers are not supported") {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestAuthIdentifierOmitsAbsentExtensions(t *testing.T) {
+	r := newRuntime(t, Definition{Metadata: metadata(), Capabilities: pluginapi.Capabilities{AuthProvider: APIKeyAuth{Provider: "echo"}}}, nil)
+	register(t, r)
+	env := rpc(t, r, "auth.identifier", map[string]any{})
+	if !env.OK {
+		t.Fatal(env.Error)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(env.Result, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if len(fields) != 1 || string(fields["identifier"]) != `"echo"` {
+		t.Fatalf("unexpected fields %s", env.Result)
+	}
+}
+
+func TestAuthIdentifierWithoutAuthProvider(t *testing.T) {
+	// API-key-only definitions may leave AuthProvider unset for the host's
+	// generic auth-file path. Forwarding must not enable that capability.
+	r := newRuntime(t, Definition{Metadata: metadata()}, nil)
+	env := rpc(t, r, "plugin.register", map[string]any{"schema_version": 10})
+	if !env.OK {
+		t.Fatal(env.Error)
+	}
+	var reg registration
+	if err := json.Unmarshal(env.Result, &reg); err != nil {
+		t.Fatal(err)
+	}
+	if reg.Capabilities.Auth {
+		t.Fatal("advertised absent auth provider")
+	}
+	if env := rpc(t, r, "auth.identifier", map[string]any{}); env.OK || env.Error == nil || env.Error.Code != "unsupported_method" || len(env.Result) != 0 {
+		t.Fatalf("dispatched absent auth provider: %+v", env)
+	}
+}
+
+type panickingOwnershipAuth struct{ APIKeyAuth }
+
+func (panickingOwnershipAuth) CredentialProviders() []string { panic("private-ownership-detail") }
+
+func TestAuthIdentifierExtensionPanicRedacted(t *testing.T) {
+	r := newRuntime(t, Definition{Metadata: metadata(), Capabilities: pluginapi.Capabilities{AuthProvider: panickingOwnershipAuth{APIKeyAuth{Provider: "echo"}}}}, nil)
+	register(t, r)
+	env := rpc(t, r, "auth.identifier", map[string]any{})
+	if env.OK || env.Error == nil || env.Error.Code != "plugin_panic" || strings.Contains(env.Error.Message, "private-ownership-detail") || len(env.Result) != 0 {
+		t.Fatalf("ownership panic not contained: %+v", env)
+	}
+}
