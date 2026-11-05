@@ -12,8 +12,8 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
-// maxStreamEventBytes bounds the data lines of one buffered SSE event,
-// including one separator per line but excluding the SSE field prefixes.
+// maxStreamEventBytes bounds buffered SSE data values plus one separator per
+// line, excluding data: prefixes. Native events also charge other fields verbatim.
 const maxStreamEventBytes = 8 << 20
 
 type streamFraming struct {
@@ -43,8 +43,9 @@ func frameSSEChunks(ctx context.Context, in <-chan pluginapi.ExecutorStreamChunk
 			defer onExit()
 		}
 		var line []byte
-		var event []byte // each data line is terminated by '\n'
-		var name string
+		var event []byte       // each data line is terminated by '\n'
+		var nativeEvent []byte // original fields with normalized LF separators
+		var nativeBytes int    // same data budget, plus metadata/comment bytes
 		firstLine := true
 		send := func(c pluginapi.ExecutorStreamChunk) error {
 			select {
@@ -55,8 +56,16 @@ func frameSSEChunks(ctx context.Context, in <-chan pluginapi.ExecutorStreamChunk
 			}
 		}
 		dispatch := func() error {
-			eventName := name
-			name = ""
+			if framing.native {
+				if len(nativeEvent) == 0 {
+					return nil
+				}
+				payload := append(nativeEvent, '\n')
+				// The receiver owns this buffer; never reuse it for another event.
+				nativeEvent = nil
+				nativeBytes = 0
+				return send(pluginapi.ExecutorStreamChunk{Payload: payload})
+			}
 			if len(event) == 0 {
 				return nil
 			}
@@ -76,12 +85,6 @@ func frameSSEChunks(ctx context.Context, in <-chan pluginapi.ExecutorStreamChunk
 			if !framing.bare {
 				payload = "data: " + payload
 			}
-			if framing.native {
-				if eventName != "" {
-					payload = "event: " + eventName + "\n" + payload
-				}
-				payload += "\n\n"
-			}
 			return send(pluginapi.ExecutorStreamChunk{Payload: []byte(payload)})
 		}
 		withoutBOM := func(l []byte) []byte {
@@ -90,44 +93,69 @@ func frameSSEChunks(ctx context.Context, in <-chan pluginapi.ExecutorStreamChunk
 			}
 			return l
 		}
-		dataValue := func(l []byte) []byte {
+		dataValue := func(l []byte) ([]byte, bool) {
+			if bytes.Equal(l, []byte("data")) {
+				return nil, true // a colonless field has an empty value
+			}
+			if !bytes.HasPrefix(l, []byte("data:")) {
+				return nil, false
+			}
 			v := l[len("data:"):]
 			if len(v) > 0 && v[0] == ' ' {
 				v = v[1:]
 			}
-			return v
+			return v, true
 		}
-		checkLine := func(l []byte) error {
+		checkLine := func(l []byte, complete bool) error {
 			l = withoutBOM(l)
-			if bytes.HasPrefix(l, []byte("data:")) {
-				if len(event)+len(dataValue(l))+1 > maxStreamEventBytes {
+			v, data := dataValue(l)
+			if data && (complete || bytes.HasPrefix(l, []byte("data:"))) {
+				buffered := len(event)
+				if framing.native {
+					buffered = nativeBytes
+				}
+				if buffered+len(v)+1 > maxStreamEventBytes {
 					return errStreamEventTooLarge
 				}
 			} else if len(l) > maxStreamEventBytes {
+				return errStreamEventTooLarge
+			} else if framing.native && complete && len(l) > 0 && nativeBytes+len(l)+1 > maxStreamEventBytes {
 				return errStreamEventTooLarge
 			}
 			return nil
 		}
 		field := func(l []byte) error {
+			if err := checkLine(l, true); err != nil {
+				return err
+			}
 			l = withoutBOM(l)
 			firstLine = false
-			switch {
-			case len(l) == 0:
+			if len(l) == 0 {
 				return dispatch()
-			case l[0] == ':':
-				// comment
-			case bytes.HasPrefix(l, []byte("data:")):
-				event = append(event, dataValue(l)...)
-				event = append(event, '\n')
-			case bytes.HasPrefix(l, []byte("event:")):
-				name = string(bytes.TrimPrefix(l[len("event:"):], []byte(" ")))
-			default:
+			}
+			v, data := dataValue(l)
+			if !data {
 				// Missing Content-Type retains the SSE assumption. Do not turn
 				// unsupported bare JSON/NDJSON into an empty successful stream.
 				v := bytes.TrimSpace(l)
 				if len(v) > 0 && (v[0] == '{' || v[0] == '[' || json.Valid(v)) {
 					return invalidStreamChunk("invalid_stream: expected SSE fields, received bare JSON")
 				}
+			}
+			if framing.native {
+				// Retain fields in source order, including metadata-only events,
+				// comments and unknown fields. The downstream SSE client applies
+				// id/retry validation; do not invent or persist parser state here.
+				nativeEvent = append(nativeEvent, l...)
+				nativeEvent = append(nativeEvent, '\n')
+				if data {
+					nativeBytes += len(v) + 1
+				} else {
+					nativeBytes += len(l) + 1
+				}
+			} else if data {
+				event = append(event, v...)
+				event = append(event, '\n')
 			}
 			return nil
 		}
@@ -143,6 +171,12 @@ func frameSSEChunks(ctx context.Context, in <-chan pluginapi.ExecutorStreamChunk
 							if err := field(line); err != nil {
 								return err
 							}
+						}
+						if framing.native {
+							// EOF is not an SSE event delimiter. Translators keep
+							// their historical flush, but native clients must not
+							// receive a fabricated completion event.
+							return nil
 						}
 						return dispatch()
 					}
@@ -167,7 +201,7 @@ func frameSSEChunks(ctx context.Context, in <-chan pluginapi.ExecutorStreamChunk
 							return errStreamEventTooLarge
 						}
 						line = append(line, buf[:n]...)
-						if err := checkLine(line); err != nil {
+						if err := checkLine(line, false); err != nil {
 							return err
 						}
 						if i < 0 {

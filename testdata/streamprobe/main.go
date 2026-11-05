@@ -42,7 +42,7 @@ func (fixtureHTTP) Do(context.Context, pluginapi.HTTPRequest) (pluginapi.HTTPRes
 	panic("stream-only fixture")
 }
 func (fixtureHTTP) DoStream(context.Context, pluginapi.HTTPRequest) (pluginapi.HTTPStreamResponse, error) {
-	wire := ""
+	wire := "id: 17\nretry: 2000\n\n"
 	for _, payload := range []struct{ name, data string }{
 		{"message_start", `{"type":"message_start","message":{"id":"fixture","type":"message","role":"assistant","model":"fixture","content":[],"usage":{"input_tokens":1,"output_tokens":0}}}`},
 		{"content_block_start", `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`},
