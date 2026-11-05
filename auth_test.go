@@ -273,7 +273,7 @@ func TestAuthIdentifierWithoutAuthProvider(t *testing.T) {
 	if reg.Capabilities.Auth {
 		t.Fatal("advertised absent auth provider")
 	}
-	if env := rpc(t, r, "auth.identifier", map[string]any{}); env.OK || env.Error == nil || env.Error.Code != "unknown_method" {
+	if env := rpc(t, r, "auth.identifier", map[string]any{}); env.OK || env.Error == nil || env.Error.Code != "unsupported_method" || len(env.Result) != 0 {
 		t.Fatalf("dispatched absent auth provider: %+v", env)
 	}
 }
