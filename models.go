@@ -32,6 +32,10 @@ const ModelsFetchTimeout = 15 * time.Second
 // try.
 const MaxModelsBody = 1 << 20
 
+// maxLastGoodGenerations bounds the durable last-good store. Entries are
+// evicted oldest-first once the store is full; TTL never evicts them.
+const maxLastGoodGenerations = 256
+
 // FetchModelsFunc returns candidate models for one auth. Provider-owned
 // protocol parsing stays outside the kit: custom Fetch implementations that
 // use req.HTTPClient directly are responsible for their own post-return
@@ -151,9 +155,11 @@ type ModelCatalogConfig struct {
 	// plugin-side. It runs only on the fresh path: last-good and static
 	// results were already validated or are trusted as configured. An
 	// error is a failed fetch and never replaces last-good. Its
-	// returned record ids are re-checked against Allow/Deny before
-	// namespacing and caching, so Validate cannot bypass the glob
-	// policy.
+	// returned ids preserve the upstream glob decision: ids the
+	// pipeline already approved survive (including ContributorID
+	// rewrites whose source was allowed), deny always wins, and ids
+	// Validate invented face the full allow/deny check, so Validate
+	// cannot bypass the glob policy.
 	Validate func(ctx context.Context, req pluginapi.AuthModelRequest, models []pluginapi.ModelInfo) ([]pluginapi.ModelInfo, error)
 }
 
@@ -175,7 +181,10 @@ type ModelCatalogConfig struct {
 // incompatible upstream payload never erases last-good. Errors are never
 // cached and a failed fetch, failed Validate or oversized body never
 // replaces last-good. The last-good store has no TTL eviction and
-// persists until a newer successful fetch replaces it or Invalidate runs.
+// persists until a newer successful fetch replaces it or Invalidate
+// runs; it is still bounded at maxLastGoodGenerations credential
+// generations (FIFO eviction), so plugins sharing one catalog across
+// many auths should call Invalidate on credential rotation.
 // Fetch verification is catalog availability only: it does not bypass
 // credential validity, auth disablement, provider entitlements or
 // executor authorization, which the host and executor still enforce
@@ -195,10 +204,14 @@ type ModelCatalog struct {
 	allow     []string
 	deny      []string
 	validate  func(ctx context.Context, req pluginapi.AuthModelRequest, models []pluginapi.ModelInfo) ([]pluginapi.ModelInfo, error)
-	mu        sync.Mutex
-	lastGood  map[modelCatalogKey][]pluginapi.ModelInfo
-	freshness map[modelCatalogKey]time.Time
-	inflight  map[modelCatalogKey]*modelFlight
+	// waitHook is a test-only seam: invoked (without mu held) when a
+	// concurrent waiter attaches to an in-flight fetch. Nil in use.
+	waitHook      func()
+	mu            sync.Mutex
+	lastGood      map[modelCatalogKey][]pluginapi.ModelInfo
+	lastGoodOrder []modelCatalogKey
+	freshness     map[modelCatalogKey]time.Time
+	inflight      map[modelCatalogKey]*modelFlight
 }
 
 type modelCatalogKey struct {
@@ -320,7 +333,11 @@ func (c *ModelCatalog) ModelsForAuth(ctx context.Context, req pluginapi.AuthMode
 		c.mu.Lock()
 		c.pruneFreshnessLocked(c.now())
 		if e := c.inflight[key]; e != nil {
+			hook := c.waitHook
 			c.mu.Unlock()
+			if hook != nil {
+				hook()
+			}
 			select {
 			case <-ctx.Done():
 				return pluginapi.ModelResponse{}, ctx.Err()
@@ -347,7 +364,7 @@ func (c *ModelCatalog) ModelsForAuth(ctx context.Context, req pluginapi.AuthMode
 				c.freshness[key] = c.now()
 			}
 			if cache {
-				c.lastGood[key] = cloneModelInfos(models)
+				c.cacheLastGoodLocked(key, models)
 			}
 		}
 		e.models = cloneModelInfos(models)
@@ -375,9 +392,19 @@ func (c *ModelCatalog) fetchAndServe(ctx context.Context, req pluginapi.AuthMode
 	if ferr == nil {
 		mid = c.applyGlobOverrides(raw)
 		if c.validate != nil {
+			// Preserve the glob decisions already made for the
+			// pipeline output: a ContributorID rewrite is allowed
+			// because its source id was, so re-checking the
+			// rewritten id against Allow would drop an approved
+			// model. Validate-added ids still face the full
+			// allow/deny policy.
+			approved := make(map[string]bool, len(mid))
+			for _, m := range mid {
+				approved[m.ID] = true
+			}
 			mid, ferr = c.callValidate(fetchCtx, req, mid)
 			if ferr == nil {
-				mid = c.filterByGlobs(mid)
+				mid = c.filterAfterValidate(mid, approved)
 			}
 		}
 	}
@@ -422,6 +449,19 @@ func (c *ModelCatalog) callValidate(ctx context.Context, req pluginapi.AuthModel
 	return cloneModelInfos(out), nil
 }
 
+// cacheLastGoodLocked stores one successful generation, evicting the
+// oldest generations first once the store is full. Callers hold mu.
+func (c *ModelCatalog) cacheLastGoodLocked(key modelCatalogKey, models []pluginapi.ModelInfo) {
+	if _, ok := c.lastGood[key]; !ok {
+		c.lastGoodOrder = append(c.lastGoodOrder, key)
+		for len(c.lastGoodOrder) > maxLastGoodGenerations {
+			delete(c.lastGood, c.lastGoodOrder[0])
+			c.lastGoodOrder = c.lastGoodOrder[1:]
+		}
+	}
+	c.lastGood[key] = cloneModelInfos(models)
+}
+
 // fallback never drops a known model: last-good first (even a cached
 // legitimate empty), then the static list through the pipeline. The fetch
 // error surfaces only when nothing is available.
@@ -452,6 +492,9 @@ func (c *ModelCatalog) Invalidate(authID string) {
 			delete(c.lastGood, key)
 		}
 	}
+	c.lastGoodOrder = slices.DeleteFunc(c.lastGoodOrder, func(key modelCatalogKey) bool {
+		return key.AuthID == authID
+	})
 	for key := range c.freshness {
 		if key.AuthID == authID {
 			delete(c.freshness, key)
@@ -542,12 +585,31 @@ func (c *ModelCatalog) applyNamespace(models []pluginapi.ModelInfo) []pluginapi.
 	return filterModels(c.namespace, prefixed)
 }
 
-// filterByGlobs applies the allow/deny policy alone. Validate output
-// runs through it so a returned record can never bypass deny rules.
+// filterByGlobs applies the allow/deny policy alone.
 func (c *ModelCatalog) filterByGlobs(models []pluginapi.ModelInfo) []pluginapi.ModelInfo {
 	filtered := make([]pluginapi.ModelInfo, 0, len(models))
 	for _, m := range models {
 		if !globAllows(c.allow, m.ID) || globDenies(c.deny, m.ID) {
+			continue
+		}
+		filtered = append(filtered, m)
+	}
+	return filtered
+}
+
+// filterAfterValidate applies the allow/deny policy to Validate output
+// while preserving the upstream glob decisions. An id the pipeline
+// already approved (a ContributorID rewrite whose source passed the
+// first glob pass) is kept even when it fails Allow on its rewritten
+// form; deny always wins, so a denied id never survives either way.
+// Ids Validate invented still need the full policy check.
+func (c *ModelCatalog) filterAfterValidate(models []pluginapi.ModelInfo, approved map[string]bool) []pluginapi.ModelInfo {
+	filtered := make([]pluginapi.ModelInfo, 0, len(models))
+	for _, m := range models {
+		if globDenies(c.deny, m.ID) {
+			continue
+		}
+		if !approved[m.ID] && !globAllows(c.allow, m.ID) {
 			continue
 		}
 		filtered = append(filtered, m)

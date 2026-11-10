@@ -23,6 +23,10 @@ type fakeModelsHostClient struct {
 	body    []byte
 	block   bool
 	sawDone bool
+	// blocked, when non-nil, receives one signal when a Do call
+	// enters its blocking path so tests can cancel deterministically
+	// instead of sleeping. Buffered cap 1, sent non-blockingly.
+	blocked chan struct{}
 	lastReq pluginapi.HTTPRequest
 	lastURL string
 }
@@ -35,6 +39,12 @@ func (f *fakeModelsHostClient) Do(ctx context.Context, req pluginapi.HTTPRequest
 	doErr, status, body, block := f.doErr, f.status, f.body, f.block
 	f.mu.Unlock()
 	if block {
+		if f.blocked != nil {
+			select {
+			case f.blocked <- struct{}{}:
+			default:
+			}
+		}
 		<-ctx.Done()
 		f.mu.Lock()
 		f.sawDone = true
@@ -610,7 +620,7 @@ func TestModelCatalogDerivedDeadlineFallsBack(t *testing.T) {
 }
 
 func TestModelCatalogParentCancellationPropagates(t *testing.T) {
-	host := &fakeModelsHostClient{status: 200, body: []byte(`{"data":[]}`), block: true}
+	host := &fakeModelsHostClient{status: 200, body: []byte(`{"data":[]}`), block: true, blocked: make(chan struct{}, 1)}
 	cat := NewModelCatalog(ModelCatalogConfig{Namespace: "meta", Static: namedModels("static-1"), Fetch: OpenAIModelsFetcher("https://api.example.test/v1", "/models", nil)})
 	req := catalogAuthReq("auth-1")
 	req.HTTPClient = host
@@ -620,7 +630,11 @@ func TestModelCatalogParentCancellationPropagates(t *testing.T) {
 		resp, _ := cat.ModelsForAuth(ctx, req)
 		done <- resp
 	}()
-	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-host.blocked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("fetch never reached the blocking host call")
+	}
 	cancel()
 	select {
 	case resp := <-done:
@@ -799,6 +813,13 @@ func TestModelCatalogLeaderCancelWaiterRetries(t *testing.T) {
 		return namedModels("fresh"), nil
 	}
 	cat := NewModelCatalog(ModelCatalogConfig{Namespace: "meta", Fetch: fetch})
+	waiterAttached := make(chan struct{}, 1)
+	cat.waitHook = func() {
+		select {
+		case waiterAttached <- struct{}{}:
+		default:
+		}
+	}
 	leaderCtx, cancelLeader := context.WithCancel(context.Background())
 	leaderDone := make(chan error, 1)
 	go func() {
@@ -815,9 +836,14 @@ func TestModelCatalogLeaderCancelWaiterRetries(t *testing.T) {
 		resp, err := cat.ModelsForAuth(context.Background(), catalogAuthReq("auth-1"))
 		waiterDone <- result{resp, err}
 	}()
-	// Let the waiter attach to the in-flight fetch, then cancel the
-	// leader's context: the waiter must retry, not inherit it.
-	time.Sleep(75 * time.Millisecond)
+	// Wait until the waiter has actually attached to the in-flight
+	// fetch, then cancel the leader's context: the waiter must
+	// retry, not inherit it.
+	select {
+	case <-waiterAttached:
+	case <-time.After(5 * time.Second):
+		t.Fatal("waiter never attached to the in-flight fetch")
+	}
 	cancelLeader()
 	select {
 	case err := <-leaderDone:
@@ -840,5 +866,99 @@ func TestModelCatalogLeaderCancelWaiterRetries(t *testing.T) {
 	}
 	if n := calls.Load(); n != 2 {
 		t.Fatalf("fetch calls = %d, want 2 (cancelled leader + waiter retry)", n)
+	}
+}
+
+func TestModelCatalogContributorOverrideSurvivesValidate(t *testing.T) {
+	fx := &modelsFixture{}
+	fx.set(namedModels("base"), nil)
+	cat := NewModelCatalog(ModelCatalogConfig{
+		Namespace: "meta",
+		Fetch:     fx.fetch,
+		Allow:     []string{"base"},
+		Overrides: map[string]ModelOverride{"base": {ContributorID: "base-contributor"}},
+		Validate: func(_ context.Context, _ pluginapi.AuthModelRequest, models []pluginapi.ModelInfo) ([]pluginapi.ModelInfo, error) {
+			return models, nil
+		},
+	})
+	resp, err := cat.ModelsForAuth(context.Background(), catalogAuthReq("auth-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := modelIDs(resp.Models), []string{"meta/base-contributor"}; !slices.Equal(got, want) {
+		t.Fatalf("contributor override served %v, want %v (the approved rewrite must survive the post-Validate glob check)", got, want)
+	}
+	// The rewritten id is cached as last-good: a later fetch
+	// failure serves it rather than an empty list.
+	fx.set(nil, errors.New("boom"))
+	resp, err = cat.ModelsForAuth(context.Background(), catalogAuthReq("auth-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := modelIDs(resp.Models), []string{"meta/base-contributor"}; !slices.Equal(got, want) {
+		t.Fatalf("last-good after contributor fetch served %v, want %v", got, want)
+	}
+}
+
+func TestModelCatalogValidateAddedModelFacesGlobs(t *testing.T) {
+	fx := &modelsFixture{}
+	fx.set(namedModels("base"), nil)
+	cat := NewModelCatalog(ModelCatalogConfig{
+		Namespace: "meta",
+		Fetch:     fx.fetch,
+		Allow:     []string{"base"},
+		Overrides: map[string]ModelOverride{"base": {ContributorID: "base-contributor"}},
+		Validate: func(_ context.Context, _ pluginapi.AuthModelRequest, models []pluginapi.ModelInfo) ([]pluginapi.ModelInfo, error) {
+			return append(models, namedModels("invented")...), nil
+		},
+	})
+	resp, err := cat.ModelsForAuth(context.Background(), catalogAuthReq("auth-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := modelIDs(resp.Models), []string{"meta/base-contributor"}; !slices.Equal(got, want) {
+		t.Fatalf("Validate-invented non-allowed id served %v, want only %v", got, want)
+	}
+}
+
+func TestModelCatalogLastGoodBounded(t *testing.T) {
+	fx := &modelsFixture{}
+	fx.set(namedModels("a"), nil)
+	cat := NewModelCatalog(ModelCatalogConfig{Namespace: "meta", Fetch: fx.fetch})
+	for i := 0; i < 2*maxLastGoodGenerations; i++ {
+		if _, err := cat.ModelsForAuth(context.Background(), catalogAuthReq(fmt.Sprintf("auth-%d", i))); err != nil {
+			t.Fatalf("fetch %d: %v", i, err)
+		}
+	}
+	missing, _ := cat.authKey(catalogAuthReq("auth-0"), "meta")
+	present, _ := cat.authKey(catalogAuthReq(fmt.Sprintf("auth-%d", 2*maxLastGoodGenerations-1)), "meta")
+	cat.mu.Lock()
+	if n := len(cat.lastGood); n != maxLastGoodGenerations {
+		cat.mu.Unlock()
+		t.Fatalf("last-good entries = %d, want the bound %d", n, maxLastGoodGenerations)
+	}
+	if n := len(cat.lastGoodOrder); n != len(cat.lastGood) {
+		cat.mu.Unlock()
+		t.Fatalf("last-good order entries = %d, want %d (order must track the store)", n, len(cat.lastGood))
+	}
+	if _, ok := cat.lastGood[missing]; ok {
+		cat.mu.Unlock()
+		t.Fatal("oldest generation auth-0 still retained, want FIFO eviction")
+	}
+	if _, ok := cat.lastGood[present]; !ok {
+		cat.mu.Unlock()
+		t.Fatal("newest generation evicted, want only the oldest evicted")
+	}
+	before := len(cat.lastGood)
+	cat.mu.Unlock()
+	// Invalidate keeps the order slice tracking the store.
+	cat.Invalidate(fmt.Sprintf("auth-%d", 2*maxLastGoodGenerations-1))
+	cat.mu.Lock()
+	defer cat.mu.Unlock()
+	if n := len(cat.lastGood); n != before-1 {
+		t.Fatalf("last-good entries after Invalidate = %d, want %d", n, before-1)
+	}
+	if n := len(cat.lastGoodOrder); n != len(cat.lastGood) {
+		t.Fatalf("order entries after Invalidate = %d, want %d", n, len(cat.lastGood))
 	}
 }
