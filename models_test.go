@@ -3,6 +3,7 @@ package providerkit
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"slices"
 	"strings"
@@ -675,5 +676,169 @@ func TestModelCatalogStaticOnlyAndPanicFallback(t *testing.T) {
 	}
 	if got, want := modelIDs(resp.Models), []string{"meta/s-one"}; !slices.Equal(got, want) {
 		t.Fatalf("panicking fetch served %v, want static fallback %v", got, want)
+	}
+}
+
+func TestModelCatalogNamespaceRejectedRefreshKeepsLastGood(t *testing.T) {
+	fx := &modelsFixture{}
+	fx.set(namedModels("a"), nil)
+	cat := NewModelCatalog(ModelCatalogConfig{Namespace: "meta", Fetch: fx.fetch})
+	resp, err := cat.ModelsForAuth(context.Background(), catalogAuthReq("auth-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := modelIDs(resp.Models), []string{"meta/a"}; !slices.Equal(got, want) {
+		t.Fatalf("first fetch served %v, want %v", got, want)
+	}
+	// A refresh whose only candidate is namespace-incompatible
+	// (already doubled prefix) is a failed fetch, not a legitimate
+	// empty: last-good survives it.
+	fx.set(namedModels("meta/meta/b"), nil)
+	resp, err = cat.ModelsForAuth(context.Background(), catalogAuthReq("auth-1"))
+	if err != nil {
+		t.Fatalf("namespace-rejected refresh err = %v, want last-good fallback", err)
+	}
+	if got, want := modelIDs(resp.Models), []string{"meta/a"}; !slices.Equal(got, want) {
+		t.Fatalf("namespace-rejected refresh served %v, want last-good %v", got, want)
+	}
+	// And a later transport failure still falls back to the
+	// untouched last-good entry.
+	fx.set(nil, errors.New("boom"))
+	resp, err = cat.ModelsForAuth(context.Background(), catalogAuthReq("auth-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := modelIDs(resp.Models), []string{"meta/a"}; !slices.Equal(got, want) {
+		t.Fatalf("later failure served %v, want last-good %v", got, want)
+	}
+}
+
+func TestModelCatalogValidateCannotBypassDeny(t *testing.T) {
+	fx := &modelsFixture{}
+	fx.set(namedModels("approved"), nil)
+	cat := NewModelCatalog(ModelCatalogConfig{
+		Namespace: "meta",
+		Fetch:     fx.fetch,
+		Deny:      []string{"retired"},
+		Validate: func(_ context.Context, _ pluginapi.AuthModelRequest, models []pluginapi.ModelInfo) ([]pluginapi.ModelInfo, error) {
+			return append(models, namedModels("retired")...), nil
+		},
+	})
+	resp, err := cat.ModelsForAuth(context.Background(), catalogAuthReq("auth-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := modelIDs(resp.Models), []string{"meta/approved"}; !slices.Equal(got, want) {
+		t.Fatalf("Validate-renamed denied id served %v, want %v", got, want)
+	}
+	// The denied id must not be cached either: a later fetch
+	// failure serves the last-good without it.
+	fx.set(nil, errors.New("boom"))
+	resp, err = cat.ModelsForAuth(context.Background(), catalogAuthReq("auth-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := modelIDs(resp.Models), []string{"meta/approved"}; !slices.Equal(got, want) {
+		t.Fatalf("last-good after denied Validate served %v, want %v", got, want)
+	}
+}
+
+func TestModelCatalogFreshnessNotRecordedWithoutTTL(t *testing.T) {
+	fx := &modelsFixture{}
+	fx.set(nil, errors.New("boom"))
+	cat := NewModelCatalog(ModelCatalogConfig{Namespace: "meta", Fetch: fx.fetch})
+	for i := 0; i < 5; i++ {
+		_, _ = cat.ModelsForAuth(context.Background(), catalogAuthReq(fmt.Sprintf("auth-%d", i)))
+	}
+	if n := len(cat.freshness); n != 0 {
+		t.Fatalf("freshness entries = %d, want 0 (TTL unset records nothing)", n)
+	}
+	withTTL := NewModelCatalogWithTTL(ModelCatalogConfig{Namespace: "meta", Fetch: fx.fetch}, time.Minute)
+	_, _ = withTTL.ModelsForAuth(context.Background(), catalogAuthReq("auth-1"))
+	if n := len(withTTL.freshness); n == 0 {
+		t.Fatal("freshness entries = 0 with explicit TTL, want the diagnostic marker")
+	}
+}
+
+func TestModelCatalogOverridesThinkingCopiedAtConstruction(t *testing.T) {
+	levels := []string{"low"}
+	thinking := &pluginapi.ThinkingSupport{Min: 100, Levels: levels}
+	config := ModelCatalogConfig{
+		Namespace: "meta",
+		Static:    namedModels("m"),
+		Overrides: map[string]ModelOverride{"m": {Thinking: thinking}},
+	}
+	cat := NewModelCatalog(config)
+	levels[0] = "high"
+	thinking.Min = 999
+	resp, err := cat.StaticModels(context.Background(), pluginapi.StaticModelRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Models) != 1 || resp.Models[0].Thinking == nil {
+		t.Fatalf("static models = %+v, want one model with thinking", resp.Models)
+	}
+	if got := resp.Models[0].Thinking.Levels; !slices.Equal(got, []string{"low"}) {
+		t.Fatalf("thinking levels = %v, want [low] (post-construction mutation must not leak)", got)
+	}
+	if got := resp.Models[0].Thinking.Min; got != 100 {
+		t.Fatalf("thinking min = %d, want 100", got)
+	}
+}
+
+func TestModelCatalogLeaderCancelWaiterRetries(t *testing.T) {
+	var calls atomic.Int32
+	started := make(chan struct{})
+	var once sync.Once
+	fetch := func(ctx context.Context, _ pluginapi.AuthModelRequest) ([]pluginapi.ModelInfo, error) {
+		if calls.Add(1) == 1 {
+			once.Do(func() { close(started) })
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		return namedModels("fresh"), nil
+	}
+	cat := NewModelCatalog(ModelCatalogConfig{Namespace: "meta", Fetch: fetch})
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	leaderDone := make(chan error, 1)
+	go func() {
+		_, err := cat.ModelsForAuth(leaderCtx, catalogAuthReq("auth-1"))
+		leaderDone <- err
+	}()
+	<-started
+	type result struct {
+		resp pluginapi.ModelResponse
+		err  error
+	}
+	waiterDone := make(chan result, 1)
+	go func() {
+		resp, err := cat.ModelsForAuth(context.Background(), catalogAuthReq("auth-1"))
+		waiterDone <- result{resp, err}
+	}()
+	// Let the waiter attach to the in-flight fetch, then cancel the
+	// leader's context: the waiter must retry, not inherit it.
+	time.Sleep(75 * time.Millisecond)
+	cancelLeader()
+	select {
+	case err := <-leaderDone:
+		if err == nil {
+			t.Fatal("leader err = nil, want the cancellation error")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("leader did not return")
+	}
+	select {
+	case r := <-waiterDone:
+		if r.err != nil {
+			t.Fatalf("waiter err = %v, want fresh models after re-election", r.err)
+		}
+		if got, want := modelIDs(r.resp.Models), []string{"meta/fresh"}; !slices.Equal(got, want) {
+			t.Fatalf("waiter served %v, want %v", got, want)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("waiter did not return")
+	}
+	if n := calls.Load(); n != 2 {
+		t.Fatalf("fetch calls = %d, want 2 (cancelled leader + waiter retry)", n)
 	}
 }

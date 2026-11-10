@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
-	"maps"
 	"net/http"
 	"path"
 	"slices"
@@ -151,7 +150,10 @@ type ModelCatalogConfig struct {
 	// yet namespace-prefixed); e.g. probe validation that stays
 	// plugin-side. It runs only on the fresh path: last-good and static
 	// results were already validated or are trusted as configured. An
-	// error is a failed fetch and never replaces last-good.
+	// error is a failed fetch and never replaces last-good. Its
+	// returned record ids are re-checked against Allow/Deny before
+	// namespacing and caching, so Validate cannot bypass the glob
+	// policy.
 	Validate func(ctx context.Context, req pluginapi.AuthModelRequest, models []pluginapi.ModelInfo) ([]pluginapi.ModelInfo, error)
 }
 
@@ -162,12 +164,17 @@ type ModelCatalogConfig struct {
 //
 // Every ModelsForAuth invocation attempts a fresh fetch (no TTL skip);
 // only concurrent invocations sharing one key coalesce through
-// single-flight. Results fall back fresh → durable last-good → static, so
-// a transient fetch error never drops a known model: an empty upstream
-// result (before glob filtering) is a failed fetch, while a filtered-empty
-// result is a legitimate policy outcome that is served and cached. Errors
-// are never cached and a failed fetch, failed Validate or oversized body
-// never replaces last-good. The last-good store has no TTL eviction and
+// single-flight. A waiter whose shared leader failed only because the
+// leader's own context was cancelled retries as a new leader rather than
+// inheriting another caller's cancellation. Results fall back fresh →
+// durable last-good → static, so a transient fetch error never drops a
+// known model: an empty upstream result (before glob filtering) is a
+// failed fetch, while a filtered-empty result is a legitimate policy
+// outcome that is served and cached. A refresh whose candidates are all
+// rejected by the namespace filter is likewise a failed fetch, so an
+// incompatible upstream payload never erases last-good. Errors are never
+// cached and a failed fetch, failed Validate or oversized body never
+// replaces last-good. The last-good store has no TTL eviction and
 // persists until a newer successful fetch replaces it or Invalidate runs.
 // Fetch verification is catalog availability only: it does not bypass
 // credential validity, auth disablement, provider entitlements or
@@ -200,9 +207,10 @@ type modelCatalogKey struct {
 }
 
 type modelFlight struct {
-	ready  chan struct{}
-	models []pluginapi.ModelInfo
-	err    error
+	ready          chan struct{}
+	models         []pluginapi.ModelInfo
+	err            error
+	leaderCanceled bool
 }
 
 // NewModelCatalog creates an empty model catalog for its lifetime.
@@ -214,7 +222,7 @@ func NewModelCatalog(config ModelCatalogConfig) *ModelCatalog {
 		ttl:       config.TTL,
 		timeout:   ModelsFetchTimeout,
 		now:       time.Now,
-		overrides: maps.Clone(config.Overrides),
+		overrides: cloneOverrides(config.Overrides),
 		allow:     slices.Clone(config.Allow),
 		deny:      slices.Clone(config.Deny),
 		validate:  config.Validate,
@@ -308,34 +316,46 @@ func (c *ModelCatalog) ModelsForAuth(ctx context.Context, req pluginapi.AuthMode
 	if err != nil {
 		return pluginapi.ModelResponse{}, err
 	}
-	c.mu.Lock()
-	c.pruneFreshnessLocked(c.now())
-	if e := c.inflight[key]; e != nil {
-		c.mu.Unlock()
-		select {
-		case <-ctx.Done():
-			return pluginapi.ModelResponse{}, ctx.Err()
-		case <-e.ready:
+	for {
+		c.mu.Lock()
+		c.pruneFreshnessLocked(c.now())
+		if e := c.inflight[key]; e != nil {
+			c.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return pluginapi.ModelResponse{}, ctx.Err()
+			case <-e.ready:
+			}
+			// The shared leader failed on its own cancelled
+			// context and there is nothing to fall back to: a
+			// waiter with a live context retries instead of
+			// inheriting the other caller's cancellation.
+			if e.leaderCanceled && e.err != nil && ctx.Err() == nil {
+				continue
+			}
 			return pluginapi.ModelResponse{Provider: provider, Models: cloneModelInfos(e.models)}, e.err
 		}
-	}
-	e := &modelFlight{ready: make(chan struct{})}
-	c.inflight[key] = e
-	c.mu.Unlock()
-	models, cache, ferr := c.fetchAndServe(ctx, req, key)
-	c.mu.Lock()
-	if c.inflight[key] == e {
-		delete(c.inflight, key)
-		c.freshness[key] = c.now()
-		if cache {
-			c.lastGood[key] = cloneModelInfos(models)
+		e := &modelFlight{ready: make(chan struct{})}
+		c.inflight[key] = e
+		c.mu.Unlock()
+		models, cache, ferr := c.fetchAndServe(ctx, req, key)
+		e.leaderCanceled = ctx.Err() != nil
+		c.mu.Lock()
+		if c.inflight[key] == e {
+			delete(c.inflight, key)
+			if c.ttl > 0 {
+				c.freshness[key] = c.now()
+			}
+			if cache {
+				c.lastGood[key] = cloneModelInfos(models)
+			}
 		}
+		e.models = cloneModelInfos(models)
+		e.err = ferr
+		close(e.ready)
+		c.mu.Unlock()
+		return pluginapi.ModelResponse{Provider: provider, Models: cloneModelInfos(models)}, ferr
 	}
-	e.models = cloneModelInfos(models)
-	e.err = ferr
-	close(e.ready)
-	c.mu.Unlock()
-	return pluginapi.ModelResponse{Provider: provider, Models: cloneModelInfos(models)}, ferr
 }
 
 // fetchAndServe runs the fresh path or the fallback chain and reports
@@ -356,10 +376,23 @@ func (c *ModelCatalog) fetchAndServe(ctx context.Context, req pluginapi.AuthMode
 		mid = c.applyGlobOverrides(raw)
 		if c.validate != nil {
 			mid, ferr = c.callValidate(fetchCtx, req, mid)
+			if ferr == nil {
+				mid = c.filterByGlobs(mid)
+			}
 		}
 	}
 	if ferr == nil {
-		return c.applyNamespace(mid), true, nil
+		out := c.applyNamespace(mid)
+		if len(mid) > 0 && len(out) == 0 {
+			// Every surviving candidate was rejected by the
+			// namespace filter: the upstream payload is
+			// incompatible with this catalog, not an intentional
+			// empty policy outcome. Treat the refresh as a
+			// failed fetch so last-good survives.
+			ferr = rpcError("models_fetch_failed", "model discovery returned no usable models", 502)
+		} else {
+			return out, true, nil
+		}
 	}
 	return c.fallback(key, ferr)
 }
@@ -450,13 +483,7 @@ func (c *ModelCatalog) pipeline(raw []pluginapi.ModelInfo) []pluginapi.ModelInfo
 // overrides (e.g. an explicit ContributorID rewrite colliding with a real
 // sibling) keeps the first entry.
 func (c *ModelCatalog) applyGlobOverrides(raw []pluginapi.ModelInfo) []pluginapi.ModelInfo {
-	filtered := make([]pluginapi.ModelInfo, 0, len(raw))
-	for _, m := range cloneModelInfos(raw) {
-		if !globAllows(c.allow, m.ID) || globDenies(c.deny, m.ID) {
-			continue
-		}
-		filtered = append(filtered, m)
-	}
+	filtered := c.filterByGlobs(cloneModelInfos(raw))
 	present := make(map[string]bool, len(filtered))
 	for _, m := range filtered {
 		present[m.ID] = true
@@ -515,6 +542,19 @@ func (c *ModelCatalog) applyNamespace(models []pluginapi.ModelInfo) []pluginapi.
 	return filterModels(c.namespace, prefixed)
 }
 
+// filterByGlobs applies the allow/deny policy alone. Validate output
+// runs through it so a returned record can never bypass deny rules.
+func (c *ModelCatalog) filterByGlobs(models []pluginapi.ModelInfo) []pluginapi.ModelInfo {
+	filtered := make([]pluginapi.ModelInfo, 0, len(models))
+	for _, m := range models {
+		if !globAllows(c.allow, m.ID) || globDenies(c.deny, m.ID) {
+			continue
+		}
+		filtered = append(filtered, m)
+	}
+	return filtered
+}
+
 func globAllows(allow []string, id string) bool {
 	if len(allow) == 0 {
 		return true
@@ -534,6 +574,20 @@ func globDenies(deny []string, id string) bool {
 		}
 	}
 	return false
+}
+
+// cloneOverrides deep-copies the override map, including each Thinking
+// value, so later mutation of the config cannot alter served models.
+func cloneOverrides(in map[string]ModelOverride) map[string]ModelOverride {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]ModelOverride, len(in))
+	for k, ov := range in {
+		ov.Thinking = cloneThinking(ov.Thinking)
+		out[k] = ov
+	}
+	return out
 }
 
 func cloneModelInfos(models []pluginapi.ModelInfo) []pluginapi.ModelInfo {
