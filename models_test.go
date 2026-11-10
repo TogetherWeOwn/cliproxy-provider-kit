@@ -962,3 +962,173 @@ func TestModelCatalogLastGoodBounded(t *testing.T) {
 		t.Fatalf("order entries after Invalidate = %d, want %d", n, len(cat.lastGood))
 	}
 }
+
+func TestModelCatalogKeepContributorSiblings(t *testing.T) {
+	// Real sibling pair as distinct upstream offerings: base and
+	// contributor ids carry different descriptions, so keeping both
+	// must preserve each entry's own fields.
+	siblings := []pluginapi.ModelInfo{
+		{ID: "paid-model", Object: "model", DisplayName: "Paid Model", Description: "paid upstream offering"},
+		{ID: "paid-model-contributor", Object: "model", DisplayName: "Paid Model Contributor", Description: "contributor variant"},
+		{ID: "solo-model", Object: "model", DisplayName: "Solo Model"},
+	}
+	fix := &modelsFixture{models: siblings}
+	cat := NewModelCatalog(ModelCatalogConfig{
+		Namespace:               "meta",
+		Static:                  siblings,
+		Fetch:                   fix.fetch,
+		KeepContributorSiblings: true,
+	})
+	resp, err := cat.ModelsForAuth(context.Background(), catalogAuthReq("auth-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := modelIDs(resp.Models), []string{"meta/paid-model", "meta/paid-model-contributor", "meta/solo-model"}; !slices.Equal(got, want) {
+		t.Fatalf("kept-sibling ids %v, want both siblings %v", got, want)
+	}
+	if resp.Models[0].Description != "paid upstream offering" || resp.Models[1].Description != "contributor variant" {
+		t.Fatalf("sibling fields %+v, want each entry's own description preserved", resp.Models[:2])
+	}
+	if err := CheckModelNamespace("meta", resp.Models); err != nil {
+		t.Fatalf("runtime namespace check: %v", err)
+	}
+	// Uniform pipeline: static serves both siblings too.
+	sresp, err := cat.StaticModels(context.Background(), pluginapi.StaticModelRequest{Plugin: pluginapi.Metadata{Name: "meta"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := modelIDs(sresp.Models), []string{"meta/paid-model", "meta/paid-model-contributor", "meta/solo-model"}; !slices.Equal(got, want) {
+		t.Fatalf("static kept-sibling ids %v, want %v", got, want)
+	}
+	// Both ids are cached as last-good: a later failing fetch serves
+	// the pair, not a deduped single.
+	fix.set(nil, errors.New("boom"))
+	resp, err = cat.ModelsForAuth(context.Background(), catalogAuthReq("auth-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := modelIDs(resp.Models), []string{"meta/paid-model", "meta/paid-model-contributor", "meta/solo-model"}; !slices.Equal(got, want) {
+		t.Fatalf("last-good kept-sibling ids %v, want %v", got, want)
+	}
+	// Default stays opted in to dedup for the same input.
+	deduped := NewModelCatalog(ModelCatalogConfig{
+		Namespace: "meta",
+		Static:    siblings,
+		Fetch:     (&modelsFixture{models: siblings}).fetch,
+	})
+	dresp, err := deduped.ModelsForAuth(context.Background(), catalogAuthReq("auth-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := modelIDs(dresp.Models), []string{"meta/paid-model-contributor", "meta/solo-model"}; !slices.Equal(got, want) {
+		t.Fatalf("default ids %v, want contributor win %v", got, want)
+	}
+}
+
+func TestModelCatalogHostRoutingEditKeepsLastGood(t *testing.T) {
+	fix := &modelsFixture{models: namedModels("a")}
+	cat := NewModelCatalog(ModelCatalogConfig{Namespace: "meta", Static: namedModels("static-1"), Fetch: fix.fetch})
+	reqA := catalogAuthReq("auth-1")
+	reqA.Metadata = map[string]any{"label": "old label", "type": "meta"}
+	reqA.Attributes = map[string]string{"priority": "1", "weight": "1"}
+	if _, err := cat.ModelsForAuth(context.Background(), reqA); err != nil {
+		t.Fatal(err)
+	}
+	// A label/priority/weight/prefix edit with the same storage keeps
+	// the generation: a failed fetch still serves last-good.
+	fix.set(nil, errors.New("boom"))
+	reqB := catalogAuthReq("auth-1")
+	reqB.Metadata = map[string]any{"label": "new label", "prefix": "renamed", "priority": 99, "type": "meta"}
+	reqB.Attributes = map[string]string{"priority": "99", "weight": "5"}
+	resp, err := cat.ModelsForAuth(context.Background(), reqB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := modelIDs(resp.Models), []string{"meta/a"}; !slices.Equal(got, want) {
+		t.Fatalf("routing-edit fetch served %v, want last-good %v", got, want)
+	}
+	// Rotation still invalidates: a new api_key in storage starts a new
+	// generation, so a failing fetch falls back to static, never the
+	// old generation's list.
+	reqC := catalogAuthReq("auth-1")
+	reqC.StorageJSON = []byte(`{"api_key":"rotated-key"}`)
+	reqC.Metadata = map[string]any{"label": "old label", "type": "meta"}
+	reqC.Attributes = map[string]string{"priority": "1", "weight": "1"}
+	resp, err = cat.ModelsForAuth(context.Background(), reqC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := modelIDs(resp.Models), []string{"meta/static-1"}; !slices.Equal(got, want) {
+		t.Fatalf("rotated credential served %v, want static %v, not stale last-good", got, want)
+	}
+	// Credential material in metadata (an api_key override) is not a
+	// routing field: changing it also starts a new generation.
+	reqD := catalogAuthReq("auth-1")
+	reqD.Metadata = map[string]any{"api_key": "metadata-key", "label": "old label", "type": "meta"}
+	reqD.Attributes = map[string]string{"priority": "1", "weight": "1"}
+	resp, err = cat.ModelsForAuth(context.Background(), reqD)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := modelIDs(resp.Models), []string{"meta/static-1"}; !slices.Equal(got, want) {
+		t.Fatalf("metadata-credential fetch served %v, want static %v", got, want)
+	}
+}
+
+func TestModelCatalogCredentialKeyHook(t *testing.T) {
+	fix := &modelsFixture{models: namedModels("a")}
+	keyHook := func(req pluginapi.AuthModelRequest) ([]byte, error) {
+		key, err := APIKey(req.StorageJSON, req.Metadata)
+		if err != nil {
+			return nil, err
+		}
+		return []byte(key), nil
+	}
+	cat := NewModelCatalog(ModelCatalogConfig{
+		Namespace:     "meta",
+		Static:        namedModels("static-1"),
+		Fetch:         fix.fetch,
+		CredentialKey: keyHook,
+	})
+	reqA := catalogAuthReq("auth-1")
+	reqA.Metadata = map[string]any{"label": "old label"}
+	if _, err := cat.ModelsForAuth(context.Background(), reqA); err != nil {
+		t.Fatal(err)
+	}
+	// Label edit + failed fetch keeps fallback via the hook.
+	fix.set(nil, errors.New("boom"))
+	reqB := catalogAuthReq("auth-1")
+	reqB.Metadata = map[string]any{"label": "new label", "priority": "extra host field"}
+	resp, err := cat.ModelsForAuth(context.Background(), reqB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := modelIDs(resp.Models), []string{"meta/a"}; !slices.Equal(got, want) {
+		t.Fatalf("hook label-edit served %v, want last-good %v", got, want)
+	}
+	// Rotation changes the hook key: failing fetch serves static.
+	reqC := catalogAuthReq("auth-1")
+	reqC.StorageJSON = []byte(`{"api_key":"rotated-key"}`)
+	resp, err = cat.ModelsForAuth(context.Background(), reqC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := modelIDs(resp.Models), []string{"meta/static-1"}; !slices.Equal(got, want) {
+		t.Fatalf("hook rotated served %v, want static %v", got, want)
+	}
+	// A hook error fails the call without a fetch, even though static
+	// exists (keying precedes any fallback).
+	badHook := NewModelCatalog(ModelCatalogConfig{Namespace: "meta", Static: namedModels("static-1"), Fetch: fix.fetch, CredentialKey: func(pluginapi.AuthModelRequest) ([]byte, error) {
+		return nil, errors.New("no key")
+	}})
+	if _, err := badHook.ModelsForAuth(context.Background(), catalogAuthReq("auth-1")); err == nil {
+		t.Fatal("hook error must surface")
+	}
+	// A panicking hook is recovered with the same invalid_auth failure.
+	panics := NewModelCatalog(ModelCatalogConfig{Namespace: "meta", Static: namedModels("static-1"), Fetch: fix.fetch, CredentialKey: func(pluginapi.AuthModelRequest) ([]byte, error) {
+		panic("hook panicked")
+	}})
+	if _, err := panics.ModelsForAuth(context.Background(), catalogAuthReq("auth-1")); err == nil {
+		t.Fatal("panicking hook must surface an error")
+	}
+}

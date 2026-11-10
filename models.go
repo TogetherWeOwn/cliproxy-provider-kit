@@ -150,6 +150,15 @@ type ModelCatalogConfig struct {
 	// deny wins and an empty allowlist allows everything else. An invalid
 	// pattern simply never matches.
 	Allow, Deny []string
+	// KeepContributorSiblings opts out of contributor dedup: by default,
+	// when both an id and its "-contributor" sibling appear, the base
+	// entry is dropped and the contributor entry wins. Providers whose
+	// upstream serves both ids as distinct offerings (different
+	// descriptions or prices) set this to keep both ids through the
+	// fresh, static, and last-good paths. The final-id dedup after
+	// overrides (an explicit ContributorID rewrite colliding with a real
+	// sibling) still keeps the first entry.
+	KeepContributorSiblings bool
 	// Validate is the post-fetch hook (glob and overrides applied, not
 	// yet namespace-prefixed); e.g. probe validation that stays
 	// plugin-side. It runs only on the fresh path: last-good and static
@@ -161,6 +170,19 @@ type ModelCatalogConfig struct {
 	// Validate invented face the full allow/deny check, so Validate
 	// cannot bypass the glob policy.
 	Validate func(ctx context.Context, req pluginapi.AuthModelRequest, models []pluginapi.ModelInfo) ([]pluginapi.ModelInfo, error)
+	// CredentialKey derives the credential-generation bytes that scope
+	// the last-good store (besides auth ID and provider). When nil, the
+	// key hashes the auth storage plus metadata/attributes with the
+	// host-owned display/routing fields (id, label, prefix, proxy_url,
+	// disabled, weight, priority) stripped, so a label or priority edit
+	// keeps the fallback while a key rotation still invalidates it. A
+	// provider with credential material beyond storage (for example a
+	// key that only exists in metadata) supplies this hook to name
+	// exactly which request fields constitute one generation: the
+	// returned bytes are hashed, never stored or logged. An error (or a
+	// panicking hook) fails ModelsForAuth without a fetch; a nil result
+	// with no error keys the generation by auth ID and provider only.
+	CredentialKey func(req pluginapi.AuthModelRequest) ([]byte, error)
 }
 
 // ModelCatalog implements pluginapi.ModelProvider and
@@ -184,7 +206,10 @@ type ModelCatalogConfig struct {
 // persists until a newer successful fetch replaces it or Invalidate
 // runs; it is still bounded at maxLastGoodGenerations credential
 // generations (FIFO eviction), so plugins sharing one catalog across
-// many auths should call Invalidate on credential rotation.
+// many auths should call Invalidate on credential rotation. The
+// generation key hashes credential material only (see CredentialKey):
+// host routing/display edits (label, priority, weight, prefix) keep
+// the fallback, while a credential change starts a new generation.
 // Fetch verification is catalog availability only: it does not bypass
 // credential validity, auth disablement, provider entitlements or
 // executor authorization, which the host and executor still enforce
@@ -194,16 +219,18 @@ type ModelCatalogConfig struct {
 // background fetch. A catalog is fixed once installed; recreate it on
 // reconfiguration, exactly like CachedQuota.
 type ModelCatalog struct {
-	namespace string
-	static    []pluginapi.ModelInfo
-	fetch     FetchModelsFunc
-	ttl       time.Duration
-	timeout   time.Duration
-	now       func() time.Time
-	overrides map[string]ModelOverride
-	allow     []string
-	deny      []string
-	validate  func(ctx context.Context, req pluginapi.AuthModelRequest, models []pluginapi.ModelInfo) ([]pluginapi.ModelInfo, error)
+	namespace               string
+	static                  []pluginapi.ModelInfo
+	fetch                   FetchModelsFunc
+	ttl                     time.Duration
+	timeout                 time.Duration
+	now                     func() time.Time
+	overrides               map[string]ModelOverride
+	allow                   []string
+	deny                    []string
+	validate                func(ctx context.Context, req pluginapi.AuthModelRequest, models []pluginapi.ModelInfo) ([]pluginapi.ModelInfo, error)
+	keepContributorSiblings bool
+	credentialKey           func(req pluginapi.AuthModelRequest) ([]byte, error)
 	// waitHook is a test-only seam: invoked (without mu held) when a
 	// concurrent waiter attaches to an in-flight fetch. Nil in use.
 	waitHook      func()
@@ -229,19 +256,21 @@ type modelFlight struct {
 // NewModelCatalog creates an empty model catalog for its lifetime.
 func NewModelCatalog(config ModelCatalogConfig) *ModelCatalog {
 	return &ModelCatalog{
-		namespace: config.Namespace,
-		static:    cloneModelInfos(config.Static),
-		fetch:     config.Fetch,
-		ttl:       config.TTL,
-		timeout:   ModelsFetchTimeout,
-		now:       time.Now,
-		overrides: cloneOverrides(config.Overrides),
-		allow:     slices.Clone(config.Allow),
-		deny:      slices.Clone(config.Deny),
-		validate:  config.Validate,
-		lastGood:  make(map[modelCatalogKey][]pluginapi.ModelInfo),
-		freshness: make(map[modelCatalogKey]time.Time),
-		inflight:  make(map[modelCatalogKey]*modelFlight),
+		namespace:               config.Namespace,
+		static:                  cloneModelInfos(config.Static),
+		fetch:                   config.Fetch,
+		ttl:                     config.TTL,
+		timeout:                 ModelsFetchTimeout,
+		now:                     time.Now,
+		overrides:               cloneOverrides(config.Overrides),
+		allow:                   slices.Clone(config.Allow),
+		deny:                    slices.Clone(config.Deny),
+		validate:                config.Validate,
+		keepContributorSiblings: config.KeepContributorSiblings,
+		credentialKey:           config.CredentialKey,
+		lastGood:                make(map[modelCatalogKey][]pluginapi.ModelInfo),
+		freshness:               make(map[modelCatalogKey]time.Time),
+		inflight:                make(map[modelCatalogKey]*modelFlight),
 	}
 }
 
@@ -256,16 +285,74 @@ func NewModelCatalogWithTTL(config ModelCatalogConfig, ttl time.Duration) *Model
 	return NewModelCatalog(config)
 }
 
+// hostRoutingFields are the host-owned display/routing fields the kit
+// moves from storage to metadata/attributes. They never change the
+// upstream credential, so they must not orphan the last-good fallback:
+// a label or priority edit keeps the generation, while a storage (key)
+// change still starts a new one. Fields outside this list are hashed
+// unchanged, so a provider whose credential lives in metadata or
+// attributes keeps its invalidation behavior.
+var hostRoutingFields = []string{"id", "label", "prefix", "proxy_url", "disabled", "weight", "priority"}
+
+// withoutHostRouting returns a copy of metadata/attributes with the
+// host routing fields removed; nil maps stay nil for stable hashing.
+func withoutHostRouting(metadata map[string]any, attributes map[string]string) (map[string]any, map[string]string) {
+	var md map[string]any
+	if metadata != nil {
+		md = make(map[string]any, len(metadata))
+		for k, v := range metadata {
+			md[k] = v
+		}
+		for _, name := range hostRoutingFields {
+			delete(md, name)
+		}
+	}
+	var attrs map[string]string
+	if attributes != nil {
+		attrs = make(map[string]string, len(attributes))
+		for k, v := range attributes {
+			attrs[k] = v
+		}
+		for _, name := range hostRoutingFields {
+			delete(attrs, name)
+		}
+	}
+	return md, attrs
+}
+
 func (c *ModelCatalog) authKey(req pluginapi.AuthModelRequest, provider string) (modelCatalogKey, error) {
+	if c.credentialKey != nil {
+		raw, err := c.callCredentialKey(req)
+		if err != nil {
+			return modelCatalogKey{}, err
+		}
+		return modelCatalogKey{AuthID: req.AuthID, Provider: provider, Credentials: sha256.Sum256(raw)}, nil
+	}
+	metadata, attributes := withoutHostRouting(req.Metadata, req.Attributes)
 	raw, err := json.Marshal(struct {
 		Storage    []byte
 		Metadata   map[string]any
 		Attributes map[string]string
-	}{req.StorageJSON, req.Metadata, req.Attributes})
+	}{req.StorageJSON, metadata, attributes})
 	if err != nil {
 		return modelCatalogKey{}, rpcError("invalid_auth", "invalid model credential context", 400)
 	}
 	return modelCatalogKey{AuthID: req.AuthID, Provider: provider, Credentials: sha256.Sum256(raw)}, nil
+}
+
+// callCredentialKey runs the provider's keying hook with panic
+// isolation, mirroring the fetch/Validate seams.
+func (c *ModelCatalog) callCredentialKey(req pluginapi.AuthModelRequest) (raw []byte, err error) {
+	defer func() {
+		if recover() != nil {
+			raw, err = nil, rpcError("invalid_auth", "invalid model credential context", 400)
+		}
+	}()
+	raw, err = c.credentialKey(req)
+	if err != nil {
+		return nil, rpcError("invalid_auth", "invalid model credential context", 400)
+	}
+	return append([]byte(nil), raw...), nil
 }
 
 func (c *ModelCatalog) fetchTimeout() time.Duration {
@@ -516,27 +603,32 @@ func (c *ModelCatalog) pipeline(raw []pluginapi.ModelInfo) []pluginapi.ModelInfo
 	return c.applyNamespace(c.applyGlobOverrides(raw))
 }
 
-// applyGlobOverrides filters, contributor-deduplicates and applies
-// overrides against upstream (pre-namespace) ids. Contributor dedup: when
-// both an id and its "-contributor" sibling appear, the contributor entry
-// wins and the base entry is dropped, so the model is neither
-// double-listed nor served under both ids. This needs no per-model
-// override: the pairing is discovered from the source list itself. A
-// model with no sibling keeps its base id. A final-id dedup after
-// overrides (e.g. an explicit ContributorID rewrite colliding with a real
-// sibling) keeps the first entry.
+// applyGlobOverrides filters, contributor-deduplicates (unless the
+// catalog keeps contributor siblings) and applies overrides against
+// upstream (pre-namespace) ids. Contributor dedup: when both an id and
+// its "-contributor" sibling appear, the contributor entry wins and the
+// base entry is dropped, so the model is neither double-listed nor
+// served under both ids. This needs no per-model override: the pairing
+// is discovered from the source list itself. A model with no sibling
+// keeps its base id. With KeepContributorSiblings set, both ids are
+// served because the upstream treats them as distinct offerings. A
+// final-id dedup after overrides (e.g. an explicit ContributorID
+// rewrite colliding with a real sibling) always keeps the first entry.
 func (c *ModelCatalog) applyGlobOverrides(raw []pluginapi.ModelInfo) []pluginapi.ModelInfo {
 	filtered := c.filterByGlobs(cloneModelInfos(raw))
-	present := make(map[string]bool, len(filtered))
-	for _, m := range filtered {
-		present[m.ID] = true
-	}
-	deduped := make([]pluginapi.ModelInfo, 0, len(filtered))
-	for _, m := range filtered {
-		if present[m.ID+"-contributor"] && !strings.HasSuffix(m.ID, "-contributor") {
-			continue
+	deduped := filtered
+	if !c.keepContributorSiblings {
+		present := make(map[string]bool, len(filtered))
+		for _, m := range filtered {
+			present[m.ID] = true
 		}
-		deduped = append(deduped, m)
+		deduped = make([]pluginapi.ModelInfo, 0, len(filtered))
+		for _, m := range filtered {
+			if present[m.ID+"-contributor"] && !strings.HasSuffix(m.ID, "-contributor") {
+				continue
+			}
+			deduped = append(deduped, m)
+		}
 	}
 	seen := make(map[string]bool, len(deduped))
 	out := make([]pluginapi.ModelInfo, 0, len(deduped))
