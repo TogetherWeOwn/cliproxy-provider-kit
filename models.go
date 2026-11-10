@@ -1,6 +1,7 @@
 package providerkit
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -174,14 +175,16 @@ type ModelCatalogConfig struct {
 	// the last-good store (besides auth ID and provider). When nil, the
 	// key hashes the auth storage plus metadata/attributes with the
 	// host-owned display/routing fields (id, label, prefix, proxy_url,
-	// disabled, weight, priority) stripped, so a label or priority edit
-	// keeps the fallback while a key rotation still invalidates it. A
-	// provider with credential material beyond storage (for example a
-	// key that only exists in metadata) supplies this hook to name
-	// exactly which request fields constitute one generation: the
-	// returned bytes are hashed, never stored or logged. An error (or a
-	// panicking hook) fails ModelsForAuth without a fetch; a nil result
-	// with no error keys the generation by auth ID and provider only.
+	// disabled, weight, priority, request_retry) stripped — including
+	// where the host merges them into storage — so a label or priority
+	// edit keeps the fallback while a key rotation still invalidates
+	// it. A provider with credential material beyond storage (for
+	// example a key that only exists in metadata) supplies this hook
+	// to name exactly which request fields constitute one generation:
+	// the returned bytes are hashed, never stored or logged. An error
+	// (or a panicking hook) fails ModelsForAuth without a fetch; a nil
+	// result with no error keys the generation by auth ID and provider
+	// only.
 	CredentialKey func(req pluginapi.AuthModelRequest) ([]byte, error)
 }
 
@@ -292,10 +295,11 @@ func NewModelCatalogWithTTL(config ModelCatalogConfig, ttl time.Duration) *Model
 // change still starts a new one. Fields outside this list are hashed
 // unchanged, so a provider whose credential lives in metadata or
 // attributes keeps its invalidation behavior.
-var hostRoutingFields = []string{"id", "label", "prefix", "proxy_url", "disabled", "weight", "priority"}
+var hostRoutingFields = []string{"id", "label", "prefix", "proxy_url", "disabled", "weight", "priority", "request_retry"}
 
 // withoutHostRouting returns a copy of metadata/attributes with the
-// host routing fields removed; nil maps stay nil for stable hashing.
+// host routing fields removed; a map stripped to empty becomes nil so
+// a nil-to-routing-only edit hashes like the original nil map.
 func withoutHostRouting(metadata map[string]any, attributes map[string]string) (map[string]any, map[string]string) {
 	var md map[string]any
 	if metadata != nil {
@@ -305,6 +309,9 @@ func withoutHostRouting(metadata map[string]any, attributes map[string]string) (
 		}
 		for _, name := range hostRoutingFields {
 			delete(md, name)
+		}
+		if len(md) == 0 {
+			md = nil
 		}
 	}
 	var attrs map[string]string
@@ -316,8 +323,40 @@ func withoutHostRouting(metadata map[string]any, attributes map[string]string) (
 		for _, name := range hostRoutingFields {
 			delete(attrs, name)
 		}
+		if len(attrs) == 0 {
+			attrs = nil
+		}
 	}
 	return md, attrs
+}
+
+// withoutHostRoutingStorage removes host routing fields the host merges
+// into storage (a label edit lands in the file-backed storage JSON) so
+// a routing-only edit does not orphan the fallback. Storage that is
+// absent, or strips to empty, becomes nil for stable hashing; storage
+// that is not a JSON object is returned unchanged, so a credential
+// change in it still invalidates the generation.
+func withoutHostRoutingStorage(storage []byte) []byte {
+	if len(bytes.TrimSpace(storage)) == 0 {
+		return nil
+	}
+	var fields map[string]any
+	dec := json.NewDecoder(bytes.NewReader(storage))
+	dec.UseNumber()
+	if err := dec.Decode(&fields); err != nil || fields == nil {
+		return storage
+	}
+	for _, name := range hostRoutingFields {
+		delete(fields, name)
+	}
+	if len(fields) == 0 {
+		return nil
+	}
+	cleaned, err := json.Marshal(fields)
+	if err != nil {
+		return storage
+	}
+	return cleaned
 }
 
 func (c *ModelCatalog) authKey(req pluginapi.AuthModelRequest, provider string) (modelCatalogKey, error) {
@@ -333,7 +372,7 @@ func (c *ModelCatalog) authKey(req pluginapi.AuthModelRequest, provider string) 
 		Storage    []byte
 		Metadata   map[string]any
 		Attributes map[string]string
-	}{req.StorageJSON, metadata, attributes})
+	}{withoutHostRoutingStorage(req.StorageJSON), metadata, attributes})
 	if err != nil {
 		return modelCatalogKey{}, rpcError("invalid_auth", "invalid model credential context", 400)
 	}

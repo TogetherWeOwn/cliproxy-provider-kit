@@ -1075,6 +1075,70 @@ func TestModelCatalogHostRoutingEditKeepsLastGood(t *testing.T) {
 	}
 }
 
+// TestModelCatalogRoutingOnlyNilTransitionsKeepLastGood covers the
+// routing-only edits that used to orphan the fallback: a nil map that
+// gains only routing fields, a host label merged into StorageJSON, and
+// a request_retry edit. Each keeps the credential generation, so a
+// failed fetch still serves last-good.
+func TestModelCatalogRoutingOnlyNilTransitionsKeepLastGood(t *testing.T) {
+	seed := func(t *testing.T) (*ModelCatalog, *modelsFixture) {
+		t.Helper()
+		fix := &modelsFixture{models: namedModels("a")}
+		cat := NewModelCatalog(ModelCatalogConfig{Namespace: "meta", Static: namedModels("static-1"), Fetch: fix.fetch})
+		if _, err := cat.ModelsForAuth(context.Background(), catalogAuthReq("auth-1")); err != nil {
+			t.Fatal(err)
+		}
+		fix.set(nil, errors.New("boom"))
+		return cat, fix
+	}
+	failServe := func(t *testing.T, cat *ModelCatalog, req pluginapi.AuthModelRequest, what string) {
+		t.Helper()
+		resp, err := cat.ModelsForAuth(context.Background(), req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := modelIDs(resp.Models), []string{"meta/a"}; !slices.Equal(got, want) {
+			t.Fatalf("%s served %v, want last-good %v", what, got, want)
+		}
+	}
+	t.Run("nil attributes to priority-only", func(t *testing.T) {
+		cat, _ := seed(t)
+		req := catalogAuthReq("auth-1")
+		req.Attributes = map[string]string{"priority": "5"}
+		failServe(t, cat, req, "nil-to-priority")
+	})
+	t.Run("nil metadata to label-only", func(t *testing.T) {
+		cat, _ := seed(t)
+		req := catalogAuthReq("auth-1")
+		req.Metadata = map[string]any{"label": "renamed"}
+		failServe(t, cat, req, "nil-to-label")
+	})
+	t.Run("label merged into storage", func(t *testing.T) {
+		cat, _ := seed(t)
+		req := catalogAuthReq("auth-1")
+		req.StorageJSON = []byte(`{"api_key":"test-key","label":"renamed","priority":7}`)
+		failServe(t, cat, req, "storage-label")
+	})
+	t.Run("request_retry edit", func(t *testing.T) {
+		cat, _ := seed(t)
+		req := catalogAuthReq("auth-1")
+		req.Metadata = map[string]any{"request_retry": 3}
+		failServe(t, cat, req, "request_retry")
+	})
+	t.Run("storage credential change still invalidates", func(t *testing.T) {
+		cat, _ := seed(t)
+		req := catalogAuthReq("auth-1")
+		req.StorageJSON = []byte(`{"api_key":"rotated-key","label":"renamed"}`)
+		resp, err := cat.ModelsForAuth(context.Background(), req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := modelIDs(resp.Models), []string{"meta/static-1"}; !slices.Equal(got, want) {
+			t.Fatalf("storage rotation served %v, want static %v", got, want)
+		}
+	})
+}
+
 func TestModelCatalogCredentialKeyHook(t *testing.T) {
 	fix := &modelsFixture{models: namedModels("a")}
 	keyHook := func(req pluginapi.AuthModelRequest) ([]byte, error) {
