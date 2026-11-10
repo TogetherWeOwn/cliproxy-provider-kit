@@ -12,10 +12,15 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
+
+// DefaultDrainTimeout bounds how long plugin.quiesce waits for in-flight
+// work to drain before canceling stragglers and aborting the swap.
+const DefaultDrainTimeout = 60 * time.Second
 
 // Caller is the raw host callback boundary. Results are pluginabi.Envelope JSON.
 // Implementations must support concurrent calls. Do not log request/response data.
@@ -32,7 +37,11 @@ func (f CallerFunc) Call(ctx context.Context, m string, b []byte) ([]byte, error
 
 // Definition wires SDK capabilities and lifecycle hooks. Configure receives only
 // this plugin's configuration subtree, on both registration and reconfiguration.
-// Hooks run serially after active calls/streams are canceled and drained.
+// Reconfiguration and shutdown cancel and drain active calls/streams before
+// their hooks run. Quiesce instead stops admitting new work and drains
+// in-flight work without canceling it, up to DrainTimeout; on expiry it
+// cancels stragglers and returns an error so the host aborts the swap, and
+// OnQuiesce runs only after a successful drain.
 // Capabilities and metadata must not be mutated after New. Capability methods
 // must be concurrency-safe and honor context cancellation.
 //
@@ -52,22 +61,28 @@ type Definition struct {
 	// ModelNamespace declares the fixed vendor namespace for every model id
 	// this plugin registers or serves.
 	ModelNamespace string
-	Configure      func(context.Context, []byte) error
-	OnQuiesce      func(context.Context) error
-	OnShutdown     func(context.Context) error
+	// DrainTimeout bounds how long plugin.quiesce waits for in-flight work
+	// to finish before canceling stragglers and aborting the swap. A
+	// non-positive value uses DefaultDrainTimeout. It does not affect
+	// shutdown or reconfiguration, which always cancel.
+	DrainTimeout time.Duration
+	Configure    func(context.Context, []byte) error
+	OnQuiesce    func(context.Context) error
+	OnShutdown   func(context.Context) error
 }
 
 // Runtime owns registration, dispatch and the lifetime of asynchronous work.
 type Runtime struct {
-	def       Definition
-	host      Caller
-	lifecycle sync.Mutex
-	mu        sync.Mutex
-	active    bool
-	closed    bool
-	root      context.Context
-	cancel    context.CancelFunc
-	work      sync.WaitGroup
+	def          Definition
+	host         Caller
+	drainTimeout time.Duration
+	lifecycle    sync.Mutex
+	mu           sync.Mutex
+	active       bool
+	closed       bool
+	root         context.Context
+	cancel       context.CancelFunc
+	work         sync.WaitGroup
 }
 
 // ValidateMetadata checks the metadata required by the host and public registry.
@@ -124,7 +139,11 @@ func New(d Definition, h Caller) (*Runtime, error) {
 		}
 	}
 	root, cancel := context.WithCancel(context.Background())
-	return &Runtime{def: d, host: h, root: root, cancel: cancel}, nil
+	timeout := d.DrainTimeout
+	if timeout <= 0 {
+		timeout = DefaultDrainTimeout
+	}
+	return &Runtime{def: d, host: h, drainTimeout: timeout, root: root, cancel: cancel}, nil
 }
 
 type registration struct {
@@ -202,6 +221,33 @@ func (r *Runtime) begin(parent context.Context) (context.Context, func(), error)
 	return ctx, func() { once.Do(func() { stop(); cancel(); r.work.Done() }) }, nil
 }
 func (r *Runtime) drain() { r.mu.Lock(); r.active = false; r.cancel(); r.mu.Unlock(); r.work.Wait() }
+
+// drainGraceful stops admitting new work and waits for in-flight work to
+// finish without canceling it. On DrainTimeout expiry it cancels the
+// stragglers and returns a drain_timeout error so the host aborts the swap
+// (and rolls back via a fresh registration, which replaces the canceled
+// root). It returns without waiting for the canceled stragglers to unwind:
+// a provider that ignores cancellation must not hang quiesce forever, and
+// the host's rollback registration drains them next.
+func (r *Runtime) drainGraceful() error {
+	r.mu.Lock()
+	r.active = false
+	cancel := r.cancel
+	r.mu.Unlock()
+	done := make(chan struct{})
+	go func() { r.work.Wait(); close(done) }()
+	timeout := r.drainTimeout
+	if timeout <= 0 {
+		timeout = DefaultDrainTimeout
+	}
+	select {
+	case <-done:
+		return nil
+	case <-time.After(timeout):
+		cancel()
+		return rpcError("drain_timeout", "in-flight work did not drain before quiesce deadline", 503)
+	}
+}
 func (r *Runtime) lifecycleCall(ctx context.Context, m string, raw []byte) (any, error) {
 	r.lifecycle.Lock()
 	defer r.lifecycle.Unlock()
@@ -215,7 +261,9 @@ func (r *Runtime) lifecycleCall(ctx context.Context, m string, raw []byte) (any,
 		return nil, rpcError("not_ready", "plugin has shut down", 503)
 	}
 	if m == pluginabi.MethodPluginQuiesce {
-		r.drain()
+		if err := r.drainGraceful(); err != nil {
+			return nil, err
+		}
 		if r.def.OnQuiesce != nil {
 			return struct{}{}, r.def.OnQuiesce(ctx)
 		}
