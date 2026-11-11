@@ -3,7 +3,7 @@
 Shared Go building blocks for first-class [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) provider plugins. This repository is a **library**, not an installable provider or a scheduler. The echo plugin is a loopback-only example for tests.
 
 - SDK: `github.com/router-for-me/CLIProxyAPI/v8 v8.0.63`
-- Native C ABI **1**, RPC schema **10**. Minimum host: CLIProxyAPI **v8.0.49** (schema 10); newer hosts are accepted, older hosts (schema 9 or below, v8.0.48 and earlier) are refused. Go **1.26.10+**, CGO and a C compiler. Credential-scoped upstream errors (account-wide 429s) additionally require host **v8.0.63** or newer; older schema-10 hosts ignore the scope field.
+- Native C ABI **1**, RPC schema **10**. Minimum host: CLIProxyAPI **v8.0.49** (schema 10); newer hosts are accepted, older hosts (schema 9 or below, v8.0.48 and earlier) are refused. Go **1.26.10+**, CGO and a C compiler. Credential-scoped upstream errors (account-wide 429s) additionally require host **v8.0.62** or newer; older schema-10 hosts may ignore the scope field.
 - Native libraries built with `-buildmode=c-shared`, **not** Go's `plugin` package
 - Linux is the CI-tested target. Match the deployment architecture and libc; build provider release artifacts in `golang:1.26-bookworm` for a Debian-bookworm host. The exact host/plugin Go patch versions need not match across the C ABI.
 

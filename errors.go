@@ -109,8 +109,10 @@ func RetryAfterSeconds(value string, now time.Time) int {
 // relative to now. It recognizes a numeric or RFC3339 "resets_at"/"reset_at"
 // field anywhere in the JSON body, or an RFC3339 timestamp following "resets
 // at" in a message string (for example "Your usage window resets at
-// 2026-11-11T02:59:37Z."). A non-JSON body is scanned as raw text. Missing
-// or past timestamps yield zero. No wall clock is hidden.
+// 2026-11-11T02:59:37Z."). A non-JSON body is scanned as raw text. The first
+// future candidate in deterministic order wins; expired candidates are
+// skipped, so a stale reset field cannot mask a later one. Missing or
+// entirely past timestamps yield zero. No wall clock is hidden.
 func ResetRetryAfterSeconds(body []byte, now time.Time) int {
 	if len(body) == 0 {
 		return 0
@@ -119,7 +121,7 @@ func ResetRetryAfterSeconds(body []byte, now time.Time) int {
 	if err := json.Unmarshal(body, &decoded); err != nil {
 		decoded = string(body)
 	}
-	if t, ok := findResetTime(decoded); ok {
+	if t, ok := findResetTime(decoded, now); ok {
 		return retryAfterFromTime(t, now)
 	}
 	return 0
@@ -139,16 +141,17 @@ func retryAfterFromTime(t, now time.Time) int {
 	return int(seconds)
 }
 
-func findResetTime(v any) (time.Time, bool) {
-	if t, ok := findResetField(v); ok {
+func findResetTime(v any, now time.Time) (time.Time, bool) {
+	if t, ok := findResetField(v, now); ok {
 		return t, true
 	}
-	return scanResetText(v)
+	return scanResetText(v, now)
 }
 
-// findResetField locates the first "resets_at"/"reset_at" value in the
-// decoded body, walking map keys in sorted order for determinism.
-func findResetField(v any) (time.Time, bool) {
+// findResetField locates the first future "resets_at"/"reset_at" value in
+// the decoded body, walking map keys in sorted order for determinism.
+// Expired values are skipped so a stale field cannot hide a later reset.
+func findResetField(v any, now time.Time) (time.Time, bool) {
 	switch n := v.(type) {
 	case map[string]any:
 		keys := make([]string, 0, len(n))
@@ -158,19 +161,19 @@ func findResetField(v any) (time.Time, bool) {
 		sort.Strings(keys)
 		for _, k := range keys {
 			if k == "resets_at" || k == "reset_at" {
-				if t, ok := parseResetValue(n[k]); ok {
+				if t, ok := parseResetValue(n[k]); ok && t.After(now) {
 					return t, true
 				}
 			}
 		}
 		for _, k := range keys {
-			if t, ok := findResetField(n[k]); ok {
+			if t, ok := findResetField(n[k], now); ok {
 				return t, true
 			}
 		}
 	case []any:
 		for _, e := range n {
-			if t, ok := findResetField(e); ok {
+			if t, ok := findResetField(e, now); ok {
 				return t, true
 			}
 		}
@@ -178,12 +181,27 @@ func findResetField(v any) (time.Time, bool) {
 	return time.Time{}, false
 }
 
+// epochFloatToTime converts a numeric Unix epoch to a time, preserving any
+// fractional second. Out-of-range values degrade to a far-future sentinel
+// (year 9999), which retryAfterFromTime clamps to math.MaxInt32; casting
+// them to int64 first would be implementation-defined.
+func epochFloatToTime(n float64) (time.Time, bool) {
+	if !(n > 0) { // false for NaN and non-positive values.
+		return time.Time{}, false
+	}
+	const maxUnixSeconds = 253402300799 // 9999-12-31T23:59:59Z.
+	if n > maxUnixSeconds {
+		return time.Unix(maxUnixSeconds, 0), true
+	}
+	seconds := int64(n)
+	nanoseconds := int64((n - float64(seconds)) * 1e9)
+	return time.Unix(seconds, nanoseconds), true
+}
+
 func parseResetValue(v any) (time.Time, bool) {
 	switch n := v.(type) {
 	case float64:
-		if n > 0 {
-			return time.Unix(int64(n), 0), true
-		}
+		return epochFloatToTime(n)
 	case string:
 		s := strings.TrimSpace(n)
 		if s == "" {
@@ -195,17 +213,21 @@ func parseResetValue(v any) (time.Time, bool) {
 		if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
 			return t, true
 		}
+		if f, err := strconv.ParseFloat(s, 64); err == nil {
+			return epochFloatToTime(f)
+		}
 	}
 	return time.Time{}, false
 }
 
-// scanResetText locates an RFC3339 timestamp following "resets at" in any
-// string value of the decoded body, walking map keys in sorted order.
-func scanResetText(v any) (time.Time, bool) {
+// scanResetText locates a future RFC3339 timestamp following "resets at" in
+// any string value of the decoded body, walking map keys in sorted order.
+// Expired matches are skipped like expired field values.
+func scanResetText(v any, now time.Time) (time.Time, bool) {
 	switch n := v.(type) {
 	case string:
 		if m := resetAtPattern.FindStringSubmatch(n); len(m) == 2 {
-			if t, err := time.Parse(time.RFC3339Nano, m[1]); err == nil {
+			if t, err := time.Parse(time.RFC3339Nano, m[1]); err == nil && t.After(now) {
 				return t, true
 			}
 		}
@@ -216,13 +238,13 @@ func scanResetText(v any) (time.Time, bool) {
 		}
 		sort.Strings(keys)
 		for _, k := range keys {
-			if t, ok := scanResetText(n[k]); ok {
+			if t, ok := scanResetText(n[k], now); ok {
 				return t, true
 			}
 		}
 	case []any:
 		for _, e := range n {
-			if t, ok := scanResetText(e); ok {
+			if t, ok := scanResetText(e, now); ok {
 				return t, true
 			}
 		}

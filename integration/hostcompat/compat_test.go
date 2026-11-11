@@ -187,10 +187,11 @@ func TestRealHostLoader(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The kit re-frames upstream SSE into one host chunk per data event:
-	// with no inbound route recorded the chunks keep their "data:" framing,
-	// and the upstream [DONE] is dropped (the handlers append their own
-	// terminator at the HTTP layer).
+	// The kit re-frames upstream SSE into one complete SSE event per data
+	// event; the pinned host's deframer releases each event incrementally
+	// and the same-format translator strips the "data:" prefix, so the
+	// adapter delivers bare JSON. The upstream [DONE] is dropped (the
+	// host's own terminator is likewise consumed by the translator).
 	var chunks []string
 	select {
 	case first, ok := <-stream.Chunks:
@@ -216,8 +217,8 @@ func TestRealHostLoader(t *testing.T) {
 		t.Fatalf("incomplete stream %d chunks %s", len(chunks), streamed)
 	}
 	for _, c := range chunks {
-		if !strings.HasPrefix(c, "data: ") || strings.Contains(c, "\n") {
-			t.Fatalf("chunk is not one data-framed event %q", c)
+		if !strings.HasPrefix(c, "{") || strings.Contains(c, "\n") {
+			t.Fatalf("chunk is not one bare-JSON translator frame %q", c)
 		}
 	}
 	limited := req

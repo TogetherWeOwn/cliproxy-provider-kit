@@ -99,7 +99,7 @@ func TestPassthroughFramesNonOpenAISSE(t *testing.T) {
 					t.Fatal(err)
 				}
 				got, errs := collectStream(t, resp.Chunks)
-				want := []string{"data: " + first, "data: " + last}
+				want := []string{"data: " + first + "\n\n", "data: " + last + "\n\n"}
 				if path == "/v1/messages" {
 					want = []string{"event: content_block_delta\ndata: " + first + "\n\n", "event: message_stop\ndata: " + last + "\n\n"}
 				}

@@ -189,4 +189,26 @@ func TestResetRetryAfterSeconds(t *testing.T) {
 	if got := ResetRetryAfterSeconds([]byte(fmt.Sprintf(`{"error":{"resets_at":%d}}`, far)), now); got != math.MaxInt32 {
 		t.Fatalf("far future: %d, want MaxInt32", got)
 	}
+	// An expired reset must not mask a later future one: the first future
+	// candidate in deterministic order wins.
+	jan1 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	if got := ResetRetryAfterSeconds([]byte(`{"reset_at":"2025-12-31T23:59:00Z","resets_at":"2026-01-01T00:10:00Z"}`), jan1); got != 600 {
+		t.Fatalf("past field hides future field: %d, want 600", got)
+	}
+	if got := ResetRetryAfterSeconds([]byte(`{"reset_at":"2025-12-31T23:59:00Z","message":"resets at 2026-01-01T00:10:00Z"}`), jan1); got != 600 {
+		t.Fatalf("past field hides future text: %d, want 600", got)
+	}
+	// A fractional numeric epoch keeps its sub-second part, so the final
+	// fraction still yields a one-second hint instead of zero.
+	if got := ResetRetryAfterSeconds([]byte(`{"resets_at":1767225600.9}`), jan1.Add(500*time.Millisecond)); got != 1 {
+		t.Fatalf("fractional numeric resets_at: %d, want 1", got)
+	}
+	if got := ResetRetryAfterSeconds([]byte(`{"resets_at":"1767225600.9"}`), jan1.Add(500*time.Millisecond)); got != 1 {
+		t.Fatalf("fractional string resets_at: %d, want 1", got)
+	}
+	// An out-of-range numeric epoch clamps like a far-future reset instead
+	// of converting to an implementation-defined int64.
+	if got := ResetRetryAfterSeconds([]byte(`{"resets_at":1e30}`), jan1); got != math.MaxInt32 {
+		t.Fatalf("overflowing resets_at: %d, want MaxInt32", got)
+	}
 }
