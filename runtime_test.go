@@ -1005,35 +1005,39 @@ func TestChangedReconfigureDrainsInFlightCall(t *testing.T) {
 		t.Fatal("changed reconfigure never finished")
 	}
 	mu.Lock()
-	defer mu.Unlock()
 	if len(configs) != 2 || configs[0] != "enabled: true\n" || configs[1] != "enabled: false\n" {
 		t.Fatalf("config: %q", configs)
 	}
-	// The new config is now the applied baseline: an identical reconfigure
-	// against it is a no-op again.
-	e2 := newGatedExecutor("second-generation")
-	r2 := newRuntime(t, Definition{
-		Metadata:     metadata(),
-		Capabilities: gatedCaps(e2),
-		Configure:    func(context.Context, []byte) error { return nil },
-	}, nil)
-	registerWithConfig(t, r2, "enabled: false\n")
+	mu.Unlock()
+	// The new config is now the applied baseline on the same runtime: an
+	// identical reconfigure against it is a no-op again. This only holds if
+	// lastConfig was updated by the changed reconfigure; a Register-only
+	// baseline would keep draining here.
+	e.startOnce = sync.Once{}
+	e.started = make(chan struct{})
+	e.release = make(chan struct{})
+	e.finished.Store(false)
 	exec2Done := make(chan pluginabi.Envelope, 1)
-	go func() { exec2Done <- callEnv(r2, "executor.execute", map[string]any{}) }()
+	go func() { exec2Done <- callEnv(r, "executor.execute", map[string]any{}) }()
 	select {
-	case <-e2.started:
+	case <-e.started:
 	case <-time.After(2 * time.Second):
 		t.Fatal("second execute never started")
 	}
-	if env := callEnv(r2, "plugin.reconfigure", map[string]any{"schema_version": 10, "config_yaml": []byte("enabled: false\n")}); !env.OK {
+	if env := callEnv(r, "plugin.reconfigure", map[string]any{"schema_version": 10, "config_yaml": []byte("enabled: false\n")}); !env.OK {
 		t.Fatalf("identical reconfigure against new baseline: %+v", env.Error)
 	}
+	mu.Lock()
+	if len(configs) != 2 {
+		t.Fatalf("Configure calls %d, want 2 (no-op must not re-run Configure)", len(configs))
+	}
+	mu.Unlock()
 	select {
 	case env := <-exec2Done:
 		t.Fatalf("identical reconfigure canceled in-flight execute: %+v", env)
 	default:
 	}
-	close(e2.release)
+	close(e.release)
 	select {
 	case env := <-exec2Done:
 		if !env.OK {
