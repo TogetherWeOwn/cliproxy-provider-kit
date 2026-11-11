@@ -210,6 +210,7 @@ type gatedExecutor struct {
 	startOnce sync.Once
 	started   chan struct{}
 	release   chan struct{}
+	stubborn  bool
 	payload   []byte
 	chunks    chan pluginapi.ExecutorStreamChunk
 	finished  atomic.Bool
@@ -221,6 +222,13 @@ func newGatedExecutor(payload string) *gatedExecutor {
 func (e *gatedExecutor) Identifier() string { return "echo" }
 func (e *gatedExecutor) Execute(ctx context.Context, r pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
 	e.startOnce.Do(func() { close(e.started) })
+	if e.stubborn {
+		// Ignore cancellation, like a provider stuck in a blocking call:
+		// canceling the runtime does not unwind this execution.
+		<-e.release
+		e.finished.Store(true)
+		return pluginapi.ExecutorResponse{Payload: e.payload}, nil
+	}
 	select {
 	case <-e.release:
 		e.finished.Store(true)
@@ -518,6 +526,118 @@ func TestOnQuiesceRunsAfterDrain(t *testing.T) {
 		}
 	})
 }
+func TestQuiesceIdleNeverTimesOut(t *testing.T) {
+	// Even with an absurdly short drain deadline an idle runtime must
+	// quiesce successfully: there is no work to wait for.
+	r := newRuntime(t, Definition{Metadata: metadata(), DrainTimeout: time.Nanosecond}, nil)
+	register(t, r)
+	for i := 0; i < 5; i++ {
+		if env := callEnv(r, "plugin.quiesce", nil); !env.OK {
+			t.Fatalf("idle quiesce %d: %+v", i, env)
+		}
+	}
+}
+
+func TestQuiesceTimeoutThenReregister(t *testing.T) {
+	// A provider that ignores cancellation must not crash the host when a
+	// timed-out quiesce is followed by the rollback re-registration and new
+	// work. (Regression: the WaitGroup-based waiter panicked on reuse.)
+	e := newGatedExecutor("stubborn-result")
+	e.stubborn = true
+	r := newRuntime(t, Definition{Metadata: metadata(), DrainTimeout: 50 * time.Millisecond, Capabilities: gatedCaps(e)}, nil)
+	register(t, r)
+	execDone := make(chan pluginabi.Envelope, 1)
+	go func() { execDone <- callEnv(r, "executor.execute", map[string]any{}) }()
+	select {
+	case <-e.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("execute never started")
+	}
+	// Timed-out quiesce cancels the root but the stubborn call keeps running.
+	if env := callEnv(r, "plugin.quiesce", nil); env.OK || env.Error.Code != "drain_timeout" {
+		t.Fatalf("quiesce: %+v", env)
+	}
+	// A repeated quiesce before re-registration must not panic either.
+	if env := callEnv(r, "plugin.quiesce", nil); env.OK || env.Error.Code != "drain_timeout" {
+		t.Fatalf("second quiesce: %+v", env)
+	}
+	// Rollback re-registration drains the stubborn call: release it, then the
+	// registration completes and admits new work.
+	regDone := make(chan pluginabi.Envelope, 1)
+	go func() { regDone <- callEnv(r, "plugin.register", map[string]any{"schema_version": 10}) }()
+	close(e.release)
+	select {
+	case env := <-execDone:
+		if !env.OK {
+			t.Fatalf("stubborn execute: %+v", env.Error)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("stubborn execute never finished")
+	}
+	select {
+	case env := <-regDone:
+		if !env.OK {
+			t.Fatalf("re-register: %+v", env.Error)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("re-register never finished")
+	}
+	if env := callEnv(r, "executor.identifier", nil); !env.OK {
+		t.Fatalf("work after re-register refused: %+v", env)
+	}
+}
+
+func TestQuiesceCanceledReturnsPromptly(t *testing.T) {
+	// A canceled quiesce caller does not wait for the full drain: the call
+	// returns promptly, in-flight work is not canceled, and admission stays
+	// off until the next registration.
+	e := newGatedExecutor("kept-result")
+	r := newRuntime(t, Definition{Metadata: metadata(), DrainTimeout: 30 * time.Second, Capabilities: gatedCaps(e)}, nil)
+	register(t, r)
+	execDone := make(chan pluginabi.Envelope, 1)
+	go func() { execDone <- callEnv(r, "executor.execute", map[string]any{}) }()
+	select {
+	case <-e.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("execute never started")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	quiesceDone := make(chan pluginabi.Envelope, 1)
+	go func() {
+		raw, _ := json.Marshal(nil)
+		var env pluginabi.Envelope
+		_ = json.Unmarshal(r.Call(ctx, "plugin.quiesce", raw), &env)
+		quiesceDone <- env
+	}()
+	waitForNotReady(t, r)
+	cancel()
+	select {
+	case env := <-quiesceDone:
+		if env.OK || env.Error.Code != "canceled" {
+			t.Fatalf("canceled quiesce: %+v", env)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("canceled quiesce never returned")
+	}
+	select {
+	case env := <-execDone:
+		t.Fatalf("in-flight execute was canceled by quiesce cancel: %+v", env)
+	default:
+	}
+	close(e.release)
+	select {
+	case env := <-execDone:
+		if !env.OK {
+			t.Fatalf("in-flight execute: %+v", env.Error)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("in-flight execute never finished")
+	}
+	if env := callEnv(r, "executor.identifier", nil); env.OK || env.Error.Code != "not_ready" {
+		t.Fatalf("after canceled quiesce: %+v", env)
+	}
+}
+
 func TestRuntimePanicIsRedacted(t *testing.T) {
 	e := &testExecutor{panicExecute: true}
 	r := newRuntime(t, Definition{Metadata: metadata(), Capabilities: pluginapi.Capabilities{Executor: e, ExecutorInputFormats: []string{"openai"}, ExecutorOutputFormats: []string{"openai"}}}, nil)

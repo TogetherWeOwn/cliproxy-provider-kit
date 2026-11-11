@@ -82,7 +82,8 @@ type Runtime struct {
 	closed       bool
 	root         context.Context
 	cancel       context.CancelFunc
-	work         sync.WaitGroup
+	inflight     int
+	drained      chan struct{}
 }
 
 // ValidateMetadata checks the metadata required by the host and public registry.
@@ -216,11 +217,38 @@ func (r *Runtime) begin(parent context.Context) (context.Context, func(), error)
 	}
 	ctx, cancel := context.WithCancel(parent)
 	stop := context.AfterFunc(r.root, cancel)
-	r.work.Add(1)
+	if r.inflight == 0 {
+		r.drained = make(chan struct{})
+	}
+	r.inflight++
 	var once sync.Once
-	return ctx, func() { once.Do(func() { stop(); cancel(); r.work.Done() }) }, nil
+	return ctx, func() {
+		once.Do(func() {
+			stop()
+			cancel()
+			r.mu.Lock()
+			r.inflight--
+			if r.inflight == 0 {
+				close(r.drained)
+			}
+			r.mu.Unlock()
+		})
+	}, nil
 }
-func (r *Runtime) drain() { r.mu.Lock(); r.active = false; r.cancel(); r.mu.Unlock(); r.work.Wait() }
+
+// drain cancels all in-flight work and waits for it to unwind. When no
+// work is outstanding it returns immediately.
+func (r *Runtime) drain() {
+	r.mu.Lock()
+	r.active = false
+	r.cancel()
+	ch, n := r.drained, r.inflight
+	r.mu.Unlock()
+	if n == 0 || ch == nil {
+		return
+	}
+	<-ch
+}
 
 // drainGraceful stops admitting new work and waits for in-flight work to
 // finish without canceling it. On DrainTimeout expiry it cancels the
@@ -228,24 +256,39 @@ func (r *Runtime) drain() { r.mu.Lock(); r.active = false; r.cancel(); r.mu.Unlo
 // (and rolls back via a fresh registration, which replaces the canceled
 // root). It returns without waiting for the canceled stragglers to unwind:
 // a provider that ignores cancellation must not hang quiesce forever, and
-// the host's rollback registration drains them next.
-func (r *Runtime) drainGraceful() error {
+// the host's rollback registration drains them next. An idle runtime
+// returns immediately. If the caller's context is canceled first, the
+// graceful wait ends with the context error: admission stays off, in-flight
+// work keeps running uncanceled, and the next registration drains it.
+func (r *Runtime) drainGraceful(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	r.mu.Lock()
 	r.active = false
 	cancel := r.cancel
+	ch, n := r.drained, r.inflight
 	r.mu.Unlock()
-	done := make(chan struct{})
-	go func() { r.work.Wait(); close(done) }()
+	if n == 0 || ch == nil {
+		return nil
+	}
 	timeout := r.drainTimeout
 	if timeout <= 0 {
 		timeout = DefaultDrainTimeout
 	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	select {
-	case <-done:
+	case <-ch:
 		return nil
-	case <-time.After(timeout):
+	case <-timer.C:
 		cancel()
 		return rpcError("drain_timeout", "in-flight work did not drain before quiesce deadline", 503)
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 func (r *Runtime) lifecycleCall(ctx context.Context, m string, raw []byte) (any, error) {
@@ -261,7 +304,7 @@ func (r *Runtime) lifecycleCall(ctx context.Context, m string, raw []byte) (any,
 		return nil, rpcError("not_ready", "plugin has shut down", 503)
 	}
 	if m == pluginabi.MethodPluginQuiesce {
-		if err := r.drainGraceful(); err != nil {
+		if err := r.drainGraceful(ctx); err != nil {
 			return nil, err
 		}
 		if r.def.OnQuiesce != nil {
