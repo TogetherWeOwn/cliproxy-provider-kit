@@ -211,6 +211,11 @@ func TestResetRetryAfterSeconds(t *testing.T) {
 	if got := ResetRetryAfterSeconds([]byte(`{"resets_at":1e30}`), jan1); got != math.MaxInt32 {
 		t.Fatalf("overflowing resets_at: %d, want MaxInt32", got)
 	}
+	// An epoch just past the year-9999 boundary is still a near reset when
+	// now sits on it; huge-epoch clamping is relative to now.
+	if got := ResetRetryAfterSeconds([]byte(`{"resets_at":253402300800}`), time.Unix(253402300799, 0)); got != 1 {
+		t.Fatalf("year-9999 boundary: %d, want 1", got)
+	}
 	// Non-finite strings are not timestamps and must not become a cooldown.
 	for _, s := range []string{"Inf", "+Inf", "-Inf", "Infinity", "NaN"} {
 		body := fmt.Sprintf(`{"resets_at":%q}`, s)

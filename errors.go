@@ -161,7 +161,7 @@ func findResetField(v any, now time.Time) (time.Time, bool) {
 		sort.Strings(keys)
 		for _, k := range keys {
 			if k == "resets_at" || k == "reset_at" {
-				if t, ok := parseResetValue(n[k]); ok && t.After(now) {
+				if t, ok := parseResetValue(n[k], now); ok && t.After(now) {
 					return t, true
 				}
 			}
@@ -183,29 +183,30 @@ func findResetField(v any, now time.Time) (time.Time, bool) {
 
 // epochFloatToTime converts a numeric Unix epoch to a time, preserving any
 // fractional second. Non-finite and non-positive values are not timestamps.
-// Out-of-range values degrade to a far-future sentinel (year 9999), which
-// retryAfterFromTime clamps to math.MaxInt32; casting them to int64 first
-// would be implementation-defined.
-func epochFloatToTime(n float64) (time.Time, bool) {
+// Epochs more than math.MaxInt32 seconds after now degrade to a sentinel at
+// now+math.MaxInt32, which retryAfterFromTime reports as math.MaxInt32;
+// casting them to int64 first would be implementation-defined.
+func epochFloatToTime(n float64, now time.Time) (time.Time, bool) {
 	if math.IsNaN(n) || math.IsInf(n, 0) {
 		return time.Time{}, false
 	}
 	if n <= 0 {
 		return time.Time{}, false
 	}
-	const maxUnixSeconds = 253402300799 // 9999-12-31T23:59:59Z.
-	if n > maxUnixSeconds {
-		return time.Unix(maxUnixSeconds, 0), true
+	if n-float64(now.Unix()) > math.MaxInt32 {
+		return now.Add(time.Duration(math.MaxInt32) * time.Second), true
 	}
+	// n is within math.MaxInt32 of now, so it fits in int64 and the
+	// duration to now cannot overflow.
 	seconds := int64(n)
 	nanoseconds := int64((n - float64(seconds)) * 1e9)
 	return time.Unix(seconds, nanoseconds), true
 }
 
-func parseResetValue(v any) (time.Time, bool) {
+func parseResetValue(v any, now time.Time) (time.Time, bool) {
 	switch n := v.(type) {
 	case float64:
-		return epochFloatToTime(n)
+		return epochFloatToTime(n, now)
 	case string:
 		s := strings.TrimSpace(n)
 		if s == "" {
@@ -218,7 +219,7 @@ func parseResetValue(v any) (time.Time, bool) {
 			return t, true
 		}
 		if f, err := strconv.ParseFloat(s, 64); err == nil {
-			return epochFloatToTime(f)
+			return epochFloatToTime(f, now)
 		}
 	}
 	return time.Time{}, false
