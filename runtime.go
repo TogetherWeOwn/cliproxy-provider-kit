@@ -37,7 +37,9 @@ func (f CallerFunc) Call(ctx context.Context, m string, b []byte) ([]byte, error
 
 // Definition wires SDK capabilities and lifecycle hooks. Configure receives only
 // this plugin's configuration subtree, on both registration and reconfiguration.
-// Reconfiguration and shutdown cancel and drain active calls/streams before
+// Reconfiguration with config bytes identical to the last applied config is a
+// no-op that leaves in-flight work untouched; reconfiguration with changed
+// config and shutdown cancel and drain active calls/streams before
 // their hooks run. Quiesce instead stops admitting new work and drains
 // in-flight work without canceling it, up to DrainTimeout; on expiry it
 // cancels stragglers and returns an error so the host aborts the swap, and
@@ -84,6 +86,7 @@ type Runtime struct {
 	cancel       context.CancelFunc
 	inflight     int
 	drained      chan struct{}
+	lastConfig   []byte
 }
 
 // ValidateMetadata checks the metadata required by the host and public registry.
@@ -324,6 +327,21 @@ func (r *Runtime) lifecycleCall(ctx context.Context, m string, raw []byte) (any,
 	if req.SchemaVersion < pluginabi.SchemaVersion {
 		return nil, rpcError("unsupported_schema", "this kit requires RPC schema 10 or newer", 400)
 	}
+	// A config.yaml edit that leaves this plugin's subtree unchanged must not
+	// cancel in-flight work. The host sends plugin.reconfigure on every config
+	// write; when the runtime is already active and the incoming bytes match
+	// the last applied config, returning the registration is a no-op. Keep
+	// the drain for Register, for changed config and for non-active runtimes
+	// (e.g. after quiesce, where reconfiguration reactivates the plugin).
+	if m == pluginabi.MethodPluginReconfigure {
+		r.mu.Lock()
+		active := r.active
+		identical := active && bytes.Equal(req.ConfigYAML, r.lastConfig)
+		r.mu.Unlock()
+		if identical {
+			return r.registration(), nil
+		}
+	}
 	r.drain()
 	if r.def.Configure != nil {
 		if err := r.def.Configure(ctx, bytes.Clone(req.ConfigYAML)); err != nil {
@@ -333,6 +351,7 @@ func (r *Runtime) lifecycleCall(ctx context.Context, m string, raw []byte) (any,
 	r.mu.Lock()
 	r.root, r.cancel = context.WithCancel(context.Background())
 	r.active = true
+	r.lastConfig = bytes.Clone(req.ConfigYAML)
 	r.mu.Unlock()
 	return r.registration(), nil
 }
