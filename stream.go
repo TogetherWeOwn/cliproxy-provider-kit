@@ -32,7 +32,7 @@ func frameStreamChunks(ctx context.Context, in <-chan pluginapi.ExecutorStreamCh
 }
 
 // frameSSEChunks splits raw HTTP reads into complete SSE events. Translators
-// consume one data: line per call (v8.0.49 adapters_executors.go); native SSE
+// consume one data: line per call (v8.0.63 adapters_executors.go); native SSE
 // handlers write full events and standalone comment lines. CR, LF and CRLF are
 // accepted, even across reads. Only a stream-leading UTF-8 BOM is ignored.
 // Unfinished data/metadata events are never delivered on a native route.
@@ -250,7 +250,7 @@ func openAIOutputFormat(r pluginapi.ExecutorRequest) bool {
 }
 
 // The host records the inbound client route in metadata. Format and SourceFormat
-// both describe the plugin's own protocol, not the client's (v8.0.49 host adapter).
+// both describe the plugin's own protocol, not the client's (v8.0.63 host adapter).
 func streamRequestPath(r pluginapi.ExecutorRequest) string {
 	path, _ := r.Metadata["request_path"].(string)
 	return strings.TrimRight(strings.TrimSpace(path), "/")
