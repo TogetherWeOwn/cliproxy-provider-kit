@@ -81,7 +81,7 @@ func TestFrameStreamChunksDataFramedForTranslatedRoutes(t *testing.T) {
 		chunks = append(chunks, streamBytes(s))
 	}
 	got, _ := collectStream(t, frameStreamChunks(context.Background(), streamFeed(chunks...), false, nil))
-	want := []string{`data: {"a":1}`, `data: {"b":2}`, `data: {"c":3}`, `data: {"d":4}`}
+	want := []string{"data: {\"a\":1}\n\n", "data: {\"b\":2}\n\n", "data: {\"c\":3}\n\n", "data: {\"d\":4}\n\n"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %q", got)
 	}
@@ -91,7 +91,7 @@ func TestFrameStreamChunksPassesErrorsThrough(t *testing.T) {
 	boom := errors.New("boom")
 	got, errs := collectStream(t, frameStreamChunks(context.Background(), streamFeed(streamBytes("data: {\"a\":1}\n\ndata: {\"trunc"), pluginapi.ExecutorStreamChunk{Payload: []byte("ated\":"), Err: boom}), false, nil))
 	// Complete events before the error are delivered; a truncated frame is not.
-	if !reflect.DeepEqual(got, []string{`data: {"a":1}`}) || len(errs) != 1 || !errors.Is(errs[0], boom) {
+	if !reflect.DeepEqual(got, []string{"data: {\"a\":1}\n\n"}) || len(errs) != 1 || !errors.Is(errs[0], boom) {
 		t.Fatalf("got %q errs %v", got, errs)
 	}
 }
@@ -148,11 +148,11 @@ func TestFrameStreamChunksCRLineEndings(t *testing.T) {
 	// Standalone CR is a valid SSE line ending, including a CRLF split
 	// across upstream reads: a trailing CR waits for the next byte.
 	got, errs := collectStream(t, frameStreamChunks(context.Background(), streamFeed(streamBytes("data: {\"a\":1}\r\rdata: {\"b\":2}\r\r")), false, nil))
-	if !reflect.DeepEqual(got, []string{`data: {"a":1}`, `data: {"b":2}`}) || len(errs) != 0 {
+	if !reflect.DeepEqual(got, []string{"data: {\"a\":1}\n\n", "data: {\"b\":2}\n\n"}) || len(errs) != 0 {
 		t.Fatalf("CR-only: got %q errs %v", got, errs)
 	}
 	got, errs = collectStream(t, frameStreamChunks(context.Background(), streamFeed(streamBytes("data: {\"a\":1}\r"), streamBytes("\n\r\ndata: {\"b\":2}\r\n\r\n")), false, nil))
-	if !reflect.DeepEqual(got, []string{`data: {"a":1}`, `data: {"b":2}`}) || len(errs) != 0 {
+	if !reflect.DeepEqual(got, []string{"data: {\"a\":1}\n\n", "data: {\"b\":2}\n\n"}) || len(errs) != 0 {
 		t.Fatalf("split CRLF: got %q errs %v", got, errs)
 	}
 }
@@ -169,7 +169,7 @@ func TestFrameStreamChunksCRDelimitedFlushesWithoutMoreInput(t *testing.T) {
 		if c.Err != nil {
 			t.Fatalf("err %v", c.Err)
 		}
-		if got := string(c.Payload); got != `data: {"a":1}` {
+		if got := string(c.Payload); got != "data: {\"a\":1}\n\n" {
 			t.Fatalf("got %q", got)
 		}
 	case <-time.After(5 * time.Second):
@@ -226,7 +226,7 @@ func TestFrameStreamChunksBoundsACompletedEvent(t *testing.T) {
 
 func TestFrameStreamChunksRefusesMultiLineNonJSON(t *testing.T) {
 	got, errs := collectStream(t, frameStreamChunks(context.Background(), streamFeed(streamBytes("data: {\"a\":1}\n\ndata: not\ndata: json\n\ndata: {\"b\":2}\n\n")), false, nil))
-	if !reflect.DeepEqual(got, []string{`data: {"a":1}`}) || len(errs) != 1 || streamRPC(t, errs[0]).Code != "invalid_stream" {
+	if !reflect.DeepEqual(got, []string{"data: {\"a\":1}\n\n"}) || len(errs) != 1 || streamRPC(t, errs[0]).Code != "invalid_stream" {
 		t.Fatalf("got %q errs %v", got, errs)
 	}
 }
@@ -247,7 +247,7 @@ func TestPassthroughExecuteStreamFramesUpstreamSSE(t *testing.T) {
 		}
 		got = append(got, string(c.Payload))
 	}
-	want := []string{`data: {"a":1}`, `data: {"b":2}`}
+	want := []string{"data: {\"a\":1}\n\n", "data: {\"b\":2}\n\n"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %q", got)
 	}
@@ -288,7 +288,7 @@ func TestFrameStreamChunksCallsOnExit(t *testing.T) {
 	// Normal completion runs it too.
 	called = false
 	got, errs := collectStream(t, frameStreamChunks(context.Background(), streamFeed(streamBytes("data: {\"a\":1}\n\n")), false, func() { called = true }))
-	if len(errs) != 0 || !reflect.DeepEqual(got, []string{`data: {"a":1}`}) || !called {
+	if len(errs) != 0 || !reflect.DeepEqual(got, []string{"data: {\"a\":1}\n\n"}) || !called {
 		t.Fatalf("got %q errs %v called %v", got, errs, called)
 	}
 }

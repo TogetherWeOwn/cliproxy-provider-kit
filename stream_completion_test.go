@@ -34,7 +34,7 @@ func TestPassthroughSSEDone(t *testing.T) {
 					}
 					want := `{"a":1}`
 					if path == "/v1/messages" {
-						want = "data: " + want
+						want = "data: " + want + "\n\n"
 					}
 					select {
 					case chunk := <-resp.Chunks:
@@ -70,7 +70,7 @@ func TestPassthroughSSEDone(t *testing.T) {
 	})
 	t.Run("non-OpenAI sentinel is data", func(t *testing.T) {
 		got, errs := collectStream(t, frameSSEChunks(context.Background(), streamFeed(streamBytes("data: [DONE]\n\ndata: {}\n\n")), streamFraming{}, nil))
-		if len(errs) != 0 || !reflect.DeepEqual(got, []string{"data: [DONE]", "data: {}"}) {
+		if len(errs) != 0 || !reflect.DeepEqual(got, []string{"data: [DONE]\n\n", "data: {}\n\n"}) {
 			t.Fatalf("got %q errs %v", got, errs)
 		}
 	})

@@ -85,7 +85,7 @@ func TestPassthroughStreamAndHTTP(t *testing.T) {
 		text += string(c.Payload)
 		streamErr = c.Err
 	}
-	if text != "data: onedata: two" || streamErr == nil {
+	if text != "data: one\n\ndata: two\n\n" || streamErr == nil {
 		t.Fatalf("stream %q %v", text, streamErr)
 	}
 	h.body = []byte("http")
@@ -245,7 +245,7 @@ func TestPassthroughStreamReleasesHostOperation(t *testing.T) {
 	// ExecuteStream re-frames upstream SSE, so the fixture speaks SSE: one
 	// data-framed chunk per event without a request_path signal.
 	upstream <- pluginapi.HTTPStreamChunk{Payload: []byte("data: one\n\n")}
-	if c := <-resp.Chunks; string(c.Payload) != "data: one" {
+	if c := <-resp.Chunks; string(c.Payload) != "data: one\n\n" {
 		t.Fatalf("chunk %+v", c)
 	}
 	// The consumer goes away while upstream is idle: the stream must end and cancel the host operation.

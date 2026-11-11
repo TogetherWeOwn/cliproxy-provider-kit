@@ -24,18 +24,22 @@ type streamFraming struct {
 }
 
 // frameStreamChunks implements the OpenAI-output chunk contract: bare JSON for
-// chat/completions clients, one data:-framed event per translator call otherwise.
-// Comments are dropped; [DONE] ends the stream. onExit releases the upstream on completion,
-// cancellation or framing error, including when the forwarder is blocked sending.
+// chat/completions clients, one complete data:-framed SSE event per translator
+// call otherwise. Comments are dropped; [DONE] ends the stream. onExit releases
+// the upstream on completion, cancellation or framing error, including when the
+// forwarder is blocked sending.
 func frameStreamChunks(ctx context.Context, in <-chan pluginapi.ExecutorStreamChunk, bare bool, onExit func()) <-chan pluginapi.ExecutorStreamChunk {
 	return frameSSEChunks(ctx, in, streamFraming{bare: bare, dropDone: true}, onExit)
 }
 
-// frameSSEChunks splits raw HTTP reads into complete SSE events. Translators
-// consume one data: line per call (v8.0.49 adapters_executors.go); native SSE
-// handlers write full events and standalone comment lines. CR, LF and CRLF are
-// accepted, even across reads. Only a stream-leading UTF-8 BOM is ignored.
-// Unfinished data/metadata events are never delivered on a native route.
+// frameSSEChunks splits raw HTTP reads into complete SSE events. Each framed
+// chunk is a complete SSE event (a data: line plus a blank line) so newer
+// hosts' SSE deframers release it incrementally; older translators trim
+// whitespace around data lines, so complete events stay compatible with them.
+// Native SSE handlers write full events and standalone comment lines. CR, LF
+// and CRLF are accepted, even across reads. Only a stream-leading UTF-8 BOM
+// is ignored. Unfinished data/metadata events are never delivered on a
+// native route.
 func frameSSEChunks(ctx context.Context, in <-chan pluginapi.ExecutorStreamChunk, framing streamFraming, onExit func()) <-chan pluginapi.ExecutorStreamChunk {
 	out := make(chan pluginapi.ExecutorStreamChunk)
 	go func() {
@@ -84,7 +88,7 @@ func frameSSEChunks(ctx context.Context, in <-chan pluginapi.ExecutorStreamChunk
 				payload = b.String()
 			}
 			if !framing.bare {
-				payload = "data: " + payload
+				payload = "data: " + payload + "\n\n"
 			}
 			return send(pluginapi.ExecutorStreamChunk{Payload: []byte(payload)})
 		}
@@ -250,7 +254,7 @@ func openAIOutputFormat(r pluginapi.ExecutorRequest) bool {
 }
 
 // The host records the inbound client route in metadata. Format and SourceFormat
-// both describe the plugin's own protocol, not the client's (v8.0.49 host adapter).
+// both describe the plugin's own protocol, not the client's (v8.0.63 host adapter).
 func streamRequestPath(r pluginapi.ExecutorRequest) string {
 	path, _ := r.Metadata["request_path"].(string)
 	return strings.TrimRight(strings.TrimSpace(path), "/")

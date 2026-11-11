@@ -25,7 +25,7 @@ func TestSSEFinalReviewRegressions(t *testing.T) {
 							t.Fatal(err)
 						}
 						got, errs := collectStream(t, resp.Chunks)
-						want := []string{"data: {}"}
+						want := []string{"data: {}\n\n"}
 						if path == "/v1/messages" {
 							want = []string{wire}
 						}

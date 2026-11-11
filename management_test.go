@@ -48,7 +48,7 @@ func TestManagementRegistrationWireExcludesLocalHandlers(t *testing.T) {
 	if !env.OK {
 		t.Fatal(env.Error)
 	}
-	// v8.0.49 rpcManagementRegistrationResponse embeds these SDK route
+	// v8.0.63 rpcManagementRegistrationResponse embeds these SDK route
 	// types. Its decoder starts with nil ManagementHandler interfaces.
 	var decoded pluginapi.ManagementRegistrationResponse
 	if err := json.Unmarshal(env.Result, &decoded); err != nil {

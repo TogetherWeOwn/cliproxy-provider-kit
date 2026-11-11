@@ -44,13 +44,13 @@ func TestSSEReviewRegressions(t *testing.T) {
 			wire string
 			want []string
 		}{
-			{"data\n\n", []string{"data: "}},
-			{"event: empty\ndata\n\n", []string{"data: "}},
-			{"data\ndata: {}\n\n", []string{"data: {}"}},
-			{"data: {}\ndata\n\n", []string{"data: {}"}},
-			{"data: {}", []string{"data: {}"}},
-			{"data: {}\n", []string{"data: {}"}},
-			{"id: 17\nretry: 123\n\ndata: {}\n\n", []string{"data: {}"}},
+			{"data\n\n", []string{"data: \n\n"}},
+			{"event: empty\ndata\n\n", []string{"data: \n\n"}},
+			{"data\ndata: {}\n\n", []string{"data: {}\n\n"}},
+			{"data: {}\ndata\n\n", []string{"data: {}\n\n"}},
+			{"data: {}", []string{"data: {}\n\n"}},
+			{"data: {}\n", []string{"data: {}\n\n"}},
+			{"id: 17\nretry: 123\n\ndata: {}\n\n", []string{"data: {}\n\n"}},
 		} {
 			got, errs := collectStream(t, frameStreamChunks(context.Background(), streamFeed(streamBytes(tc.wire)), false, nil))
 			if len(errs) != 0 || !reflect.DeepEqual(got, tc.want) {
