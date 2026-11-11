@@ -2,7 +2,7 @@
 // its import namespace; it consumes the original pinned module without a fork.
 module github.com/router-for-me/CLIProxyAPI/v8/providerkitcompat
 
-go 1.26.10
+go 1.26.11
 
 require (
 	github.com/gin-gonic/gin v1.10.1
