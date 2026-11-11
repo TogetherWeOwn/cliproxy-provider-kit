@@ -37,8 +37,10 @@ func (f CallerFunc) Call(ctx context.Context, m string, b []byte) ([]byte, error
 
 // Definition wires SDK capabilities and lifecycle hooks. Configure receives only
 // this plugin's configuration subtree, on both registration and reconfiguration.
-// Reconfiguration with config bytes identical to the last applied config is a
-// no-op that leaves in-flight work untouched; reconfiguration with changed
+// An identical-config reconfigure on an active runtime is a no-op that leaves
+// in-flight work untouched. On a non-active runtime that has not shut down
+// (e.g. after quiesce), reconfiguration runs Configure if set and
+// reactivates the runtime on success. Reconfiguration with changed
 // config and shutdown cancel and drain active calls/streams before
 // their hooks run. Quiesce instead stops admitting new work and drains
 // in-flight work without canceling it, up to DrainTimeout; on expiry it
