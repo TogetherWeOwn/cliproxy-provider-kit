@@ -1,0 +1,58 @@
+# Highest changed-file tier wins; sensitive wins overlaps. Unmatched paths,
+# including new paths, remain sensitive. This file is always sensitive.
+# Low and ordinary changes require QA; sensitive or unclassified changes and
+# QA escalations require Security followed by QA. QA verifies risk_tier.
+#
+# Content always escalates to sensitive regardless of path: new or changed
+# public endpoints or input parsing; auth, authz or sessions; crypto or keys;
+# secrets or credentials; permission checks; tenant isolation or personal
+# data; SQL, schema or migrations; dependencies or lockfiles (including dev
+# dependencies); CI or workflows; weakened assertions, deleted tests or
+# snapshots, or lowered test gates. Low test globs, if added, are additive-only
+# and never exempt test weakening. Downgrading the sensitive floor requires
+# explicit Security approval on the PR.
+#
+# LICENSE is static license prose. README.md remains sensitive because it
+# contains security, credential, build and provider integration guidance.
+# No ordinary modules are justified: runtime code crosses host, provider,
+# network or credential boundaries. Tests and fixtures remain sensitive.
+version: 1
+default_tier: sensitive
+
+tiers:
+  low:
+    - LICENSE
+  ordinary: []
+  sensitive:
+    # Review policy, CI, ownership, agent instructions and tool permissions.
+    - .github/**
+    - CODEOWNERS
+    - "**/CODEOWNERS"
+    - AGENTS.md
+    - "**/AGENTS.md"
+    - CLAUDE.md
+    - "**/CLAUDE.md"
+    - .claude/**
+    - "**/.claude/**"
+    - skills/**
+    - "**/skills/**"
+    - "**/SKILL.md"
+    # Dependency manifests, build and installation entry points.
+    - go.mod
+    - go.sum
+    - "**/go.mod"
+    - "**/go.sum"
+    - Makefile
+    - "**/Makefile"
+    - Dockerfile
+    - "**/Dockerfile*"
+    - scripts/**
+    - "**/scripts/**"
+    # Public API, auth, parsing, runtime, network and host ABI; executable
+    # examples, compatibility harnesses, tests and fixtures are also sensitive.
+    - "*.go"
+    - cabi/**
+    - examples/**
+    - integration/**
+    - testdata/**
+    - README.md
