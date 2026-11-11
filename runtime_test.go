@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -202,22 +203,441 @@ func (e *testExecutor) CountTokens(context.Context, pluginapi.ExecutorRequest) (
 func (e *testExecutor) HttpRequest(context.Context, pluginapi.ExecutorHTTPRequest) (pluginapi.ExecutorHTTPResponse, error) {
 	return pluginapi.ExecutorHTTPResponse{StatusCode: 200}, nil
 }
-func TestQuiesceCancelsInFlight(t *testing.T) {
-	e := &testExecutor{start: make(chan struct{})}
-	r := newRuntime(t, Definition{Metadata: metadata(), Capabilities: pluginapi.Capabilities{Executor: e, ExecutorInputFormats: []string{"openai"}, ExecutorOutputFormats: []string{"openai"}}}, nil)
-	register(t, r)
-	done := make(chan struct{})
-	go func() { defer close(done); r.Call(context.Background(), "executor.execute", []byte(`{}`)) }()
-	<-e.start
-	if env := rpc(t, r, "plugin.quiesce", nil); !env.OK {
-		t.Fatal(env.Error)
+
+// gatedExecutor blocks in Execute until released (or the context is
+// canceled), so tests can hold work in flight across quiesce.
+type gatedExecutor struct {
+	startOnce sync.Once
+	started   chan struct{}
+	release   chan struct{}
+	stubborn  bool
+	payload   []byte
+	chunks    chan pluginapi.ExecutorStreamChunk
+	finished  atomic.Bool
+}
+
+func newGatedExecutor(payload string) *gatedExecutor {
+	return &gatedExecutor{started: make(chan struct{}), release: make(chan struct{}), payload: []byte(payload)}
+}
+func (e *gatedExecutor) Identifier() string { return "echo" }
+func (e *gatedExecutor) Execute(ctx context.Context, r pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
+	e.startOnce.Do(func() { close(e.started) })
+	if e.stubborn {
+		// Ignore cancellation, like a provider stuck in a blocking call:
+		// canceling the runtime does not unwind this execution.
+		<-e.release
+		e.finished.Store(true)
+		return pluginapi.ExecutorResponse{Payload: e.payload}, nil
 	}
 	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("quiesce left call alive")
+	case <-e.release:
+		e.finished.Store(true)
+		return pluginapi.ExecutorResponse{Payload: e.payload}, nil
+	case <-ctx.Done():
+		return pluginapi.ExecutorResponse{}, ctx.Err()
 	}
 }
+func (e *gatedExecutor) ExecuteStream(ctx context.Context, r pluginapi.ExecutorRequest) (pluginapi.ExecutorStreamResponse, error) {
+	return pluginapi.ExecutorStreamResponse{Headers: http.Header{"Content-Type": {"text/event-stream"}}, Chunks: e.chunks}, nil
+}
+func (e *gatedExecutor) CountTokens(context.Context, pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
+	return pluginapi.ExecutorResponse{Payload: []byte(`{"total_tokens":1}`)}, nil
+}
+func (e *gatedExecutor) HttpRequest(context.Context, pluginapi.ExecutorHTTPRequest) (pluginapi.ExecutorHTTPResponse, error) {
+	return pluginapi.ExecutorHTTPResponse{StatusCode: 200}, nil
+}
+
+// callEnv is rpc without testing.T, usable from goroutines.
+func callEnv(r *Runtime, method string, req any) pluginabi.Envelope {
+	raw, _ := json.Marshal(req)
+	out := r.Call(context.Background(), method, raw)
+	var env pluginabi.Envelope
+	_ = json.Unmarshal(out, &env)
+	return env
+}
+
+func waitForNotReady(t *testing.T, r *Runtime) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		env := callEnv(r, "executor.identifier", nil)
+		if !env.OK && env.Error != nil && env.Error.Code == "not_ready" {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("admission never stopped: %+v", env)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+func gatedCaps(e *gatedExecutor) pluginapi.Capabilities {
+	return pluginapi.Capabilities{Executor: e, ExecutorInputFormats: []string{"openai"}, ExecutorOutputFormats: []string{"openai"}}
+}
+
+func TestQuiesceDrainsInFlightExecution(t *testing.T) {
+	e := newGatedExecutor("drained-result")
+	r := newRuntime(t, Definition{Metadata: metadata(), Capabilities: gatedCaps(e)}, nil)
+	register(t, r)
+	execDone := make(chan pluginabi.Envelope, 1)
+	go func() { execDone <- callEnv(r, "executor.execute", map[string]any{"payload": []byte("in-flight")}) }()
+	select {
+	case <-e.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("execute never started")
+	}
+	quiesceDone := make(chan pluginabi.Envelope, 1)
+	go func() { quiesceDone <- callEnv(r, "plugin.quiesce", nil) }()
+	select {
+	case env := <-quiesceDone:
+		t.Fatalf("quiesce returned while work in flight: %+v", env)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(e.release)
+	select {
+	case env := <-execDone:
+		if !env.OK {
+			t.Fatalf("in-flight execute failed: %+v", env.Error)
+		}
+		var resp struct {
+			Payload []byte `json:"Payload"`
+		}
+		if err := json.Unmarshal(env.Result, &resp); err != nil {
+			t.Fatalf("bad execute result: %v", err)
+		}
+		// ExecutorResponse serializes Payload as base64 string.
+		if string(resp.Payload) != "drained-result" {
+			t.Fatalf("execute payload %q", resp.Payload)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("in-flight execute never finished")
+	}
+	select {
+	case env := <-quiesceDone:
+		if !env.OK {
+			t.Fatalf("quiesce: %+v", env.Error)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("quiesce never finished")
+	}
+}
+
+func TestQuiesceDrainsInFlightStream(t *testing.T) {
+	chunks := make(chan pluginapi.ExecutorStreamChunk, 8)
+	e := newGatedExecutor("unused")
+	e.chunks = chunks
+	var mu sync.Mutex
+	var emitted [][]byte
+	closes := 0
+	streamClosed := make(chan struct{})
+	h := CallerFunc(func(ctx context.Context, m string, b []byte) ([]byte, error) {
+		var req struct {
+			StreamID    string           `json:"stream_id"`
+			Payload     []byte           `json:"payload"`
+			ErrorDetail *pluginabi.Error `json:"error_detail"`
+		}
+		_ = json.Unmarshal(b, &req)
+		mu.Lock()
+		defer mu.Unlock()
+		switch m {
+		case "host.stream.emit":
+			emitted = append(emitted, append([]byte(nil), req.Payload...))
+		case "host.stream.close":
+			closes++
+			close(streamClosed)
+		}
+		return []byte(`{"ok":true,"result":{}}`), nil
+	})
+	r := newRuntime(t, Definition{Metadata: metadata(), Capabilities: gatedCaps(e)}, h)
+	register(t, r)
+	if env := callEnv(r, "executor.execute_stream", map[string]any{"stream_id": "stream-quiesce"}); !env.OK {
+		t.Fatalf("execute_stream: %+v", env.Error)
+	}
+	quiesceDone := make(chan pluginabi.Envelope, 1)
+	go func() { quiesceDone <- callEnv(r, "plugin.quiesce", nil) }()
+	waitForNotReady(t, r)
+	chunks <- pluginapi.ExecutorStreamChunk{Payload: []byte("chunk-one")}
+	chunks <- pluginapi.ExecutorStreamChunk{Payload: []byte("chunk-two")}
+	close(chunks)
+	select {
+	case <-streamClosed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stream never closed")
+	}
+	select {
+	case env := <-quiesceDone:
+		if !env.OK {
+			t.Fatalf("quiesce: %+v", env.Error)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("quiesce never finished")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if closes != 1 {
+		t.Fatalf("stream closes %d, want 1", closes)
+	}
+	if len(emitted) != 2 || string(emitted[0]) != "chunk-one" || string(emitted[1]) != "chunk-two" {
+		t.Fatalf("emitted %q", emitted)
+	}
+}
+
+func TestQuiesceRefusesNewWork(t *testing.T) {
+	e := newGatedExecutor("ok")
+	r := newRuntime(t, Definition{Metadata: metadata(), Capabilities: gatedCaps(e)}, nil)
+	register(t, r)
+	execDone := make(chan pluginabi.Envelope, 1)
+	go func() { execDone <- callEnv(r, "executor.execute", map[string]any{}) }()
+	select {
+	case <-e.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("execute never started")
+	}
+	quiesceDone := make(chan pluginabi.Envelope, 1)
+	go func() { quiesceDone <- callEnv(r, "plugin.quiesce", nil) }()
+	waitForNotReady(t, r)
+	select {
+	case env := <-execDone:
+		t.Fatalf("in-flight execute finished early: %+v", env)
+	default:
+	}
+	close(e.release)
+	select {
+	case env := <-execDone:
+		if !env.OK {
+			t.Fatalf("in-flight execute: %+v", env.Error)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("in-flight execute never finished")
+	}
+	select {
+	case env := <-quiesceDone:
+		if !env.OK {
+			t.Fatalf("quiesce: %+v", env.Error)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("quiesce never finished")
+	}
+	if env := callEnv(r, "executor.identifier", nil); env.OK || env.Error.Code != "not_ready" {
+		t.Fatalf("after quiesce: %+v", env)
+	}
+}
+
+func TestQuiesceDrainTimeoutCancelsStraggler(t *testing.T) {
+	e := newGatedExecutor("never")
+	e.release = nil // block on context only
+	r := newRuntime(t, Definition{Metadata: metadata(), DrainTimeout: 100 * time.Millisecond, Capabilities: gatedCaps(e)}, nil)
+	register(t, r)
+	execDone := make(chan pluginabi.Envelope, 1)
+	go func() { execDone <- callEnv(r, "executor.execute", map[string]any{}) }()
+	select {
+	case <-e.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("execute never started")
+	}
+	start := time.Now()
+	env := callEnv(r, "plugin.quiesce", nil)
+	elapsed := time.Since(start)
+	if env.OK || env.Error == nil || env.Error.Code != "drain_timeout" {
+		t.Fatalf("quiesce: %+v", env)
+	}
+	if elapsed >= 2*time.Second {
+		t.Fatalf("quiesce exceeded its bound: %v", elapsed)
+	}
+	if elapsed < 100*time.Millisecond {
+		t.Fatalf("quiesce failed before its deadline: %v", elapsed)
+	}
+	select {
+	case execEnv := <-execDone:
+		if execEnv.OK {
+			t.Fatal("straggler was not canceled")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("straggler never unwound after cancel")
+	}
+}
+
+func TestOnQuiesceRunsAfterDrain(t *testing.T) {
+	t.Run("error aborts the swap", func(t *testing.T) {
+		e := newGatedExecutor("ok")
+		var calls atomic.Int32
+		var sawFinished atomic.Bool
+		r := newRuntime(t, Definition{
+			Metadata:     metadata(),
+			Capabilities: gatedCaps(e),
+			OnQuiesce: func(context.Context) error {
+				calls.Add(1)
+				sawFinished.Store(e.finished.Load())
+				return &pluginabi.Error{Code: "quiesce_denied", Message: "swap refused by hook", HTTPStatus: 503}
+			},
+		}, nil)
+		register(t, r)
+		execDone := make(chan pluginabi.Envelope, 1)
+		go func() { execDone <- callEnv(r, "executor.execute", map[string]any{}) }()
+		select {
+		case <-e.started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("execute never started")
+		}
+		quiesceDone := make(chan pluginabi.Envelope, 1)
+		go func() { quiesceDone <- callEnv(r, "plugin.quiesce", nil) }()
+		select {
+		case env := <-quiesceDone:
+			t.Fatalf("quiesce returned before drain: %+v", env)
+		case <-time.After(50 * time.Millisecond):
+		}
+		if calls.Load() != 0 {
+			t.Fatal("OnQuiesce ran before drain finished")
+		}
+		close(e.release)
+		select {
+		case env := <-execDone:
+			if !env.OK {
+				t.Fatalf("in-flight execute: %+v", env.Error)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("in-flight execute never finished")
+		}
+		select {
+		case env := <-quiesceDone:
+			if env.OK || env.Error == nil || env.Error.Code != "quiesce_denied" {
+				t.Fatalf("quiesce: %+v", env)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("quiesce never finished")
+		}
+		if calls.Load() != 1 || !sawFinished.Load() {
+			t.Fatalf("OnQuiesce calls %d sawFinished %v", calls.Load(), sawFinished.Load())
+		}
+	})
+	t.Run("nil error allows the swap", func(t *testing.T) {
+		var calls atomic.Int32
+		r := newRuntime(t, Definition{
+			Metadata:     metadata(),
+			Capabilities: gatedCaps(newGatedExecutor("ok")),
+			OnQuiesce:    func(context.Context) error { calls.Add(1); return nil },
+		}, nil)
+		register(t, r)
+		if env := callEnv(r, "plugin.quiesce", nil); !env.OK {
+			t.Fatalf("quiesce: %+v", env.Error)
+		}
+		if calls.Load() != 1 {
+			t.Fatalf("OnQuiesce calls %d", calls.Load())
+		}
+	})
+}
+func TestQuiesceIdleNeverTimesOut(t *testing.T) {
+	// Even with an absurdly short drain deadline an idle runtime must
+	// quiesce successfully: there is no work to wait for.
+	r := newRuntime(t, Definition{Metadata: metadata(), DrainTimeout: time.Nanosecond}, nil)
+	register(t, r)
+	for i := 0; i < 5; i++ {
+		if env := callEnv(r, "plugin.quiesce", nil); !env.OK {
+			t.Fatalf("idle quiesce %d: %+v", i, env)
+		}
+	}
+}
+
+func TestQuiesceTimeoutThenReregister(t *testing.T) {
+	// A provider that ignores cancellation must not crash the host when a
+	// timed-out quiesce is followed by the rollback re-registration and new
+	// work. (Regression: the WaitGroup-based waiter panicked on reuse.)
+	e := newGatedExecutor("stubborn-result")
+	e.stubborn = true
+	r := newRuntime(t, Definition{Metadata: metadata(), DrainTimeout: 50 * time.Millisecond, Capabilities: gatedCaps(e)}, nil)
+	register(t, r)
+	execDone := make(chan pluginabi.Envelope, 1)
+	go func() { execDone <- callEnv(r, "executor.execute", map[string]any{}) }()
+	select {
+	case <-e.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("execute never started")
+	}
+	// Timed-out quiesce cancels the root but the stubborn call keeps running.
+	if env := callEnv(r, "plugin.quiesce", nil); env.OK || env.Error.Code != "drain_timeout" {
+		t.Fatalf("quiesce: %+v", env)
+	}
+	// A repeated quiesce before re-registration must not panic either.
+	if env := callEnv(r, "plugin.quiesce", nil); env.OK || env.Error.Code != "drain_timeout" {
+		t.Fatalf("second quiesce: %+v", env)
+	}
+	// Rollback re-registration drains the stubborn call: release it, then the
+	// registration completes and admits new work.
+	regDone := make(chan pluginabi.Envelope, 1)
+	go func() { regDone <- callEnv(r, "plugin.register", map[string]any{"schema_version": 10}) }()
+	close(e.release)
+	select {
+	case env := <-execDone:
+		if !env.OK {
+			t.Fatalf("stubborn execute: %+v", env.Error)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("stubborn execute never finished")
+	}
+	select {
+	case env := <-regDone:
+		if !env.OK {
+			t.Fatalf("re-register: %+v", env.Error)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("re-register never finished")
+	}
+	if env := callEnv(r, "executor.identifier", nil); !env.OK {
+		t.Fatalf("work after re-register refused: %+v", env)
+	}
+}
+
+func TestQuiesceCanceledReturnsPromptly(t *testing.T) {
+	// A canceled quiesce caller does not wait for the full drain: the call
+	// returns promptly, in-flight work is not canceled, and admission stays
+	// off until the next registration.
+	e := newGatedExecutor("kept-result")
+	r := newRuntime(t, Definition{Metadata: metadata(), DrainTimeout: 30 * time.Second, Capabilities: gatedCaps(e)}, nil)
+	register(t, r)
+	execDone := make(chan pluginabi.Envelope, 1)
+	go func() { execDone <- callEnv(r, "executor.execute", map[string]any{}) }()
+	select {
+	case <-e.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("execute never started")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	quiesceDone := make(chan pluginabi.Envelope, 1)
+	go func() {
+		raw, _ := json.Marshal(nil)
+		var env pluginabi.Envelope
+		_ = json.Unmarshal(r.Call(ctx, "plugin.quiesce", raw), &env)
+		quiesceDone <- env
+	}()
+	waitForNotReady(t, r)
+	cancel()
+	select {
+	case env := <-quiesceDone:
+		if env.OK || env.Error.Code != "canceled" {
+			t.Fatalf("canceled quiesce: %+v", env)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("canceled quiesce never returned")
+	}
+	select {
+	case env := <-execDone:
+		t.Fatalf("in-flight execute was canceled by quiesce cancel: %+v", env)
+	default:
+	}
+	close(e.release)
+	select {
+	case env := <-execDone:
+		if !env.OK {
+			t.Fatalf("in-flight execute: %+v", env.Error)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("in-flight execute never finished")
+	}
+	if env := callEnv(r, "executor.identifier", nil); env.OK || env.Error.Code != "not_ready" {
+		t.Fatalf("after canceled quiesce: %+v", env)
+	}
+}
+
 func TestRuntimePanicIsRedacted(t *testing.T) {
 	e := &testExecutor{panicExecute: true}
 	r := newRuntime(t, Definition{Metadata: metadata(), Capabilities: pluginapi.Capabilities{Executor: e, ExecutorInputFormats: []string{"openai"}, ExecutorOutputFormats: []string{"openai"}}}, nil)
