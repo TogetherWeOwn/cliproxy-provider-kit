@@ -852,3 +852,198 @@ func TestStreamEmitFailureClosesWithError(t *testing.T) {
 		t.Fatalf("emits %d detail %+v", emits, detail)
 	}
 }
+
+func registerWithConfig(t *testing.T, r *Runtime, cfg string) {
+	t.Helper()
+	if env := callEnv(r, "plugin.register", map[string]any{"schema_version": 10, "config_yaml": []byte(cfg)}); !env.OK {
+		t.Fatalf("register: %+v", env.Error)
+	}
+}
+func TestIdenticalReconfigurePreservesInFlightCall(t *testing.T) {
+	const cfg = "enabled: true\n"
+	e := newGatedExecutor("kept-result")
+	var configures atomic.Int32
+	r := newRuntime(t, Definition{
+		Metadata:     metadata(),
+		Capabilities: gatedCaps(e),
+		Configure:    func(context.Context, []byte) error { configures.Add(1); return nil },
+	}, nil)
+	registerWithConfig(t, r, cfg)
+	execDone := make(chan pluginabi.Envelope, 1)
+	go func() { execDone <- callEnv(r, "executor.execute", map[string]any{}) }()
+	select {
+	case <-e.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("execute never started")
+	}
+	// The host re-sends plugin.reconfigure on every config.yaml write, even
+	// when this plugin's subtree is unchanged. That must be a no-op.
+	if env := callEnv(r, "plugin.reconfigure", map[string]any{"schema_version": 10, "config_yaml": []byte(cfg)}); !env.OK {
+		t.Fatalf("identical reconfigure: %+v", env.Error)
+	}
+	if configures.Load() != 1 {
+		t.Fatalf("Configure calls %d, want 1 (no-op must not re-run Configure)", configures.Load())
+	}
+	select {
+	case env := <-execDone:
+		t.Fatalf("identical reconfigure canceled in-flight execute: %+v", env)
+	default:
+	}
+	close(e.release)
+	select {
+	case env := <-execDone:
+		if !env.OK {
+			t.Fatalf("in-flight execute after identical reconfigure: %+v", env.Error)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("in-flight execute never finished")
+	}
+	if env := callEnv(r, "executor.identifier", nil); !env.OK {
+		t.Fatalf("admission after identical reconfigure refused: %+v", env.Error)
+	}
+}
+func TestIdenticalReconfigurePreservesInFlightStream(t *testing.T) {
+	const cfg = "enabled: true\n"
+	chunks := make(chan pluginapi.ExecutorStreamChunk, 8)
+	e := newGatedExecutor("unused")
+	e.chunks = chunks
+	var configures atomic.Int32
+	var mu sync.Mutex
+	var emitted [][]byte
+	closes := 0
+	streamClosed := make(chan struct{})
+	h := CallerFunc(func(ctx context.Context, m string, b []byte) ([]byte, error) {
+		var req struct {
+			StreamID    string           `json:"stream_id"`
+			Payload     []byte           `json:"payload"`
+			ErrorDetail *pluginabi.Error `json:"error_detail"`
+		}
+		_ = json.Unmarshal(b, &req)
+		mu.Lock()
+		defer mu.Unlock()
+		switch m {
+		case "host.stream.emit":
+			emitted = append(emitted, append([]byte(nil), req.Payload...))
+		case "host.stream.close":
+			closes++
+			close(streamClosed)
+		}
+		return []byte(`{"ok":true,"result":{}}`), nil
+	})
+	r := newRuntime(t, Definition{
+		Metadata:     metadata(),
+		Capabilities: gatedCaps(e),
+		Configure:    func(context.Context, []byte) error { configures.Add(1); return nil },
+	}, h)
+	registerWithConfig(t, r, cfg)
+	if env := callEnv(r, "executor.execute_stream", map[string]any{"stream_id": "stream-identical"}); !env.OK {
+		t.Fatalf("execute_stream: %+v", env.Error)
+	}
+	if env := callEnv(r, "plugin.reconfigure", map[string]any{"schema_version": 10, "config_yaml": []byte(cfg)}); !env.OK {
+		t.Fatalf("identical reconfigure: %+v", env.Error)
+	}
+	if configures.Load() != 1 {
+		t.Fatalf("Configure calls %d, want 1", configures.Load())
+	}
+	chunks <- pluginapi.ExecutorStreamChunk{Payload: []byte("chunk-one")}
+	chunks <- pluginapi.ExecutorStreamChunk{Payload: []byte("chunk-two")}
+	close(chunks)
+	select {
+	case <-streamClosed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stream never closed")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if closes != 1 {
+		t.Fatalf("stream closes %d, want 1", closes)
+	}
+	if len(emitted) != 2 || string(emitted[0]) != "chunk-one" || string(emitted[1]) != "chunk-two" {
+		t.Fatalf("emitted %q", emitted)
+	}
+}
+func TestChangedReconfigureDrainsInFlightCall(t *testing.T) {
+	e := newGatedExecutor("new-generation")
+	var mu sync.Mutex
+	var configs []string
+	r := newRuntime(t, Definition{
+		Metadata:     metadata(),
+		Capabilities: gatedCaps(e),
+		Configure: func(_ context.Context, b []byte) error {
+			mu.Lock()
+			defer mu.Unlock()
+			configs = append(configs, string(b))
+			return nil
+		},
+	}, nil)
+	registerWithConfig(t, r, "enabled: true\n")
+	execDone := make(chan pluginabi.Envelope, 1)
+	go func() { execDone <- callEnv(r, "executor.execute", map[string]any{}) }()
+	select {
+	case <-e.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("execute never started")
+	}
+	reconfDone := make(chan pluginabi.Envelope, 1)
+	go func() {
+		reconfDone <- callEnv(r, "plugin.reconfigure", map[string]any{"schema_version": 10, "config_yaml": []byte("enabled: false\n")})
+	}()
+	select {
+	case env := <-execDone:
+		if env.OK {
+			t.Fatal("changed reconfigure did not cancel in-flight execute")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("in-flight execute never canceled by changed reconfigure")
+	}
+	select {
+	case env := <-reconfDone:
+		if !env.OK {
+			t.Fatalf("changed reconfigure: %+v", env.Error)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("changed reconfigure never finished")
+	}
+	mu.Lock()
+	if len(configs) != 2 || configs[0] != "enabled: true\n" || configs[1] != "enabled: false\n" {
+		t.Fatalf("config: %q", configs)
+	}
+	mu.Unlock()
+	// The new config is now the applied baseline on the same runtime: an
+	// identical reconfigure against it is a no-op again. This only holds if
+	// lastConfig was updated by the changed reconfigure; a Register-only
+	// baseline would keep draining here.
+	e.startOnce = sync.Once{}
+	e.started = make(chan struct{})
+	e.release = make(chan struct{})
+	e.finished.Store(false)
+	exec2Done := make(chan pluginabi.Envelope, 1)
+	go func() { exec2Done <- callEnv(r, "executor.execute", map[string]any{}) }()
+	select {
+	case <-e.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second execute never started")
+	}
+	if env := callEnv(r, "plugin.reconfigure", map[string]any{"schema_version": 10, "config_yaml": []byte("enabled: false\n")}); !env.OK {
+		t.Fatalf("identical reconfigure against new baseline: %+v", env.Error)
+	}
+	mu.Lock()
+	if len(configs) != 2 {
+		t.Fatalf("Configure calls %d, want 2 (no-op must not re-run Configure)", len(configs))
+	}
+	mu.Unlock()
+	select {
+	case env := <-exec2Done:
+		t.Fatalf("identical reconfigure canceled in-flight execute: %+v", env)
+	default:
+	}
+	close(e.release)
+	select {
+	case env := <-exec2Done:
+		if !env.OK {
+			t.Fatalf("second execute: %+v", env.Error)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("second execute never finished")
+	}
+}
