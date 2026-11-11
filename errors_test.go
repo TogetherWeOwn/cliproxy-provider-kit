@@ -211,4 +211,16 @@ func TestResetRetryAfterSeconds(t *testing.T) {
 	if got := ResetRetryAfterSeconds([]byte(`{"resets_at":1e30}`), jan1); got != math.MaxInt32 {
 		t.Fatalf("overflowing resets_at: %d, want MaxInt32", got)
 	}
+	// Non-finite strings are not timestamps and must not become a cooldown.
+	for _, s := range []string{"Inf", "+Inf", "-Inf", "Infinity", "NaN"} {
+		body := fmt.Sprintf(`{"resets_at":%q}`, s)
+		if got := ResetRetryAfterSeconds([]byte(body), jan1); got != 0 {
+			t.Fatalf("%s resets_at: %d, want 0", s, got)
+		}
+	}
+	// An expired mention must not hide a later future one in the same message.
+	multi := `{"error":{"message":"window expired: resets at 2025-12-31T23:59:00Z. New window resets at 2026-01-01T00:10:00Z."}}`
+	if got := ResetRetryAfterSeconds([]byte(multi), jan1); got != 600 {
+		t.Fatalf("expired first mention hides future mention: %d, want 600", got)
+	}
 }

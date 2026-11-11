@@ -182,11 +182,15 @@ func findResetField(v any, now time.Time) (time.Time, bool) {
 }
 
 // epochFloatToTime converts a numeric Unix epoch to a time, preserving any
-// fractional second. Out-of-range values degrade to a far-future sentinel
-// (year 9999), which retryAfterFromTime clamps to math.MaxInt32; casting
-// them to int64 first would be implementation-defined.
+// fractional second. Non-finite and non-positive values are not timestamps.
+// Out-of-range values degrade to a far-future sentinel (year 9999), which
+// retryAfterFromTime clamps to math.MaxInt32; casting them to int64 first
+// would be implementation-defined.
 func epochFloatToTime(n float64) (time.Time, bool) {
-	if !(n > 0) { // false for NaN and non-positive values.
+	if math.IsNaN(n) || math.IsInf(n, 0) {
+		return time.Time{}, false
+	}
+	if n <= 0 {
 		return time.Time{}, false
 	}
 	const maxUnixSeconds = 253402300799 // 9999-12-31T23:59:59Z.
@@ -226,9 +230,11 @@ func parseResetValue(v any) (time.Time, bool) {
 func scanResetText(v any, now time.Time) (time.Time, bool) {
 	switch n := v.(type) {
 	case string:
-		if m := resetAtPattern.FindStringSubmatch(n); len(m) == 2 {
-			if t, err := time.Parse(time.RFC3339Nano, m[1]); err == nil && t.After(now) {
-				return t, true
+		for _, m := range resetAtPattern.FindAllStringSubmatch(n, -1) {
+			if len(m) == 2 {
+				if t, err := time.Parse(time.RFC3339Nano, m[1]); err == nil && t.After(now) {
+					return t, true
+				}
 			}
 		}
 	case map[string]any:
