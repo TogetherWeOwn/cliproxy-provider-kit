@@ -52,14 +52,24 @@ func register(t *testing.T, r *Runtime) {
 	}
 }
 func TestRuntimeLifecycle(t *testing.T) {
+	const flow = "models: [alpha, beta]\n"
+	const block = "models:\n  - alpha\n  - beta\n"
 	var configs []string
 	var stopped int
-	r := newRuntime(t, Definition{Metadata: metadata(), Configure: func(_ context.Context, b []byte) error { configs = append(configs, string(b)); return nil }, OnShutdown: func(context.Context) error { stopped++; return nil }}, nil)
+	r := newRuntime(t, Definition{
+		Metadata:  metadata(),
+		Configure: func(_ context.Context, b []byte) error { configs = append(configs, string(b)); return nil },
+		ConfigEquivalent: func(_, _ []byte) bool {
+			t.Error("configuration comparer called during registration, quiesce, or reactivation")
+			return true
+		},
+		OnShutdown: func(context.Context) error { stopped++; return nil },
+	}, nil)
 	e := rpc(t, r, "model.static", nil)
 	if e.OK || e.Error.Code != "not_ready" {
 		t.Fatalf("before register: %+v", e)
 	}
-	e = rpc(t, r, "plugin.register", map[string]any{"schema_version": 10, "config_yaml": []byte("enabled: true\n")})
+	e = rpc(t, r, "plugin.register", map[string]any{"schema_version": 10, "config_yaml": []byte(flow)})
 	if !e.OK {
 		t.Fatal(e.Error)
 	}
@@ -77,10 +87,10 @@ func TestRuntimeLifecycle(t *testing.T) {
 	if e = rpc(t, r, "auth.identifier", nil); e.OK || e.Error.Code != "not_ready" {
 		t.Fatalf("quiesced: %+v", e)
 	}
-	if e = rpc(t, r, "plugin.reconfigure", map[string]any{"schema_version": 10, "config_yaml": []byte("enabled: false\n")}); !e.OK {
+	if e = rpc(t, r, "plugin.reconfigure", map[string]any{"schema_version": 10, "config_yaml": []byte(block)}); !e.OK {
 		t.Fatal(e.Error)
 	}
-	if len(configs) != 2 || configs[0] != "enabled: true\n" || configs[1] != "enabled: false\n" {
+	if !slices.Equal(configs, []string{flow, block}) {
 		t.Fatalf("config: %q", configs)
 	}
 	if e = rpc(t, r, "unknown", nil); e.OK || e.Error.Code != "unknown_method" {

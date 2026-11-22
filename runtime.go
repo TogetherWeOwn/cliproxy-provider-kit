@@ -78,8 +78,8 @@ type Definition struct {
 	// are valid and have identical effects. Return false when equivalence cannot
 	// be established, including for invalid or ambiguous inputs. A nil hook,
 	// false result, or panic uses the normal drain and Configure path. The hook
-	// must have no side effects, must not log config, and runs serially with the
-	// lifecycle hooks while the runtime continues admitting work.
+	// must be bounded, have no side effects, and never log config. It runs
+	// serially with the lifecycle hooks while the runtime keeps admitting work.
 	ConfigEquivalent func(previous, proposed []byte) bool
 	OnQuiesce        func(context.Context) error
 	OnShutdown       func(context.Context) error
