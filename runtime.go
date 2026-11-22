@@ -37,10 +37,10 @@ func (f CallerFunc) Call(ctx context.Context, m string, b []byte) ([]byte, error
 
 // Definition wires SDK capabilities and lifecycle hooks. Configure receives only
 // this plugin's configuration subtree, on both registration and reconfiguration.
-// An identical-config reconfigure on an active runtime is a no-op that leaves
-// in-flight work untouched. On a non-active runtime that has not shut down
-// (e.g. after quiesce), reconfiguration runs Configure if set and
-// reactivates the runtime on success. Reconfiguration with changed
+// A reconfigure on an active runtime with identical bytes or a config proven
+// equivalent by ConfigEquivalent leaves in-flight work untouched. On a non-active
+// runtime that has not shut down (e.g. after quiesce), reconfiguration runs
+// Configure if set and reactivates the runtime on success. Reconfiguration with changed
 // config and shutdown cancel and drain active calls/streams before
 // their hooks run. Quiesce instead stops admitting new work and drains
 // in-flight work without canceling it, up to DrainTimeout; on expiry it
@@ -71,8 +71,18 @@ type Definition struct {
 	// shutdown or reconfiguration, which always cancel.
 	DrainTimeout time.Duration
 	Configure    func(context.Context, []byte) error
-	OnQuiesce    func(context.Context) error
-	OnShutdown   func(context.Context) error
+	// ConfigEquivalent optionally compares the last successfully applied config
+	// with the proposed config. It is called only for byte-different configs on
+	// active reconfigure, with private copies of both inputs. Return true only
+	// when Configure's parsing and validation rules establish that both inputs
+	// are valid and have identical effects. Return false when equivalence cannot
+	// be established, including for invalid or ambiguous inputs. A nil hook,
+	// false result, or panic uses the normal drain and Configure path. The hook
+	// must have no side effects, must not log config, and runs serially with the
+	// lifecycle hooks while the runtime continues admitting work.
+	ConfigEquivalent func(previous, proposed []byte) bool
+	OnQuiesce        func(context.Context) error
+	OnShutdown       func(context.Context) error
 }
 
 // Runtime owns registration, dispatch and the lifetime of asynchronous work.
@@ -329,18 +339,14 @@ func (r *Runtime) lifecycleCall(ctx context.Context, m string, raw []byte) (any,
 	if req.SchemaVersion < pluginabi.SchemaVersion {
 		return nil, rpcError("unsupported_schema", "this kit requires RPC schema 10 or newer", 400)
 	}
-	// A config.yaml edit that leaves this plugin's subtree unchanged must not
-	// cancel in-flight work. The host sends plugin.reconfigure on every config
-	// write; when the runtime is already active and the incoming bytes match
-	// the last applied config, returning the registration is a no-op. Keep
-	// the drain for Register, for changed config and for non-active runtimes
-	// (e.g. after quiesce, where reconfiguration reactivates the plugin).
+	// Hold lifecycle across comparison and any subsequent drain so the applied
+	// config and activation state stay stable while requests use the runtime.
 	if m == pluginabi.MethodPluginReconfigure {
 		r.mu.Lock()
 		active := r.active
-		identical := active && bytes.Equal(req.ConfigYAML, r.lastConfig)
+		previous := r.lastConfig
 		r.mu.Unlock()
-		if identical {
+		if active && (bytes.Equal(previous, req.ConfigYAML) || r.configEquivalent(previous, req.ConfigYAML)) {
 			return r.registration(), nil
 		}
 	}
@@ -356,6 +362,18 @@ func (r *Runtime) lifecycleCall(ctx context.Context, m string, raw []byte) (any,
 	r.lastConfig = bytes.Clone(req.ConfigYAML)
 	r.mu.Unlock()
 	return r.registration(), nil
+}
+
+func (r *Runtime) configEquivalent(previous, proposed []byte) (equivalent bool) {
+	if r.def.ConfigEquivalent == nil {
+		return false
+	}
+	defer func() {
+		if recover() != nil {
+			equivalent = false
+		}
+	}()
+	return r.def.ConfigEquivalent(bytes.Clone(previous), bytes.Clone(proposed))
 }
 
 // Shutdown cancels and drains work and runs OnShutdown once. Logical shutdown

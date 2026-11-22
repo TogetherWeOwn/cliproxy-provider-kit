@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
+	"gopkg.in/yaml.v3"
 )
 
 func metadata() pluginapi.Metadata {
@@ -962,6 +965,147 @@ func TestIdenticalReconfigurePreservesInFlightStream(t *testing.T) {
 		t.Fatalf("emitted %q", emitted)
 	}
 }
+func TestConfigEquivalentReconfigure(t *testing.T) {
+	const flow = "models: [alpha, beta]\n"
+	const block = "models:\n  - alpha\n  - beta\n"
+	parse := func(raw []byte) ([]string, error) {
+		var config struct {
+			Models []string `yaml:"models"`
+		}
+		decoder := yaml.NewDecoder(strings.NewReader(string(raw)))
+		decoder.KnownFields(true)
+		var extra yaml.Node
+		if decoder.Decode(&config) != nil || len(config.Models) == 0 || decoder.Decode(&extra) != io.EOF {
+			return nil, rpcError("invalid_config", "invalid test configuration", 400)
+		}
+		return config.Models, nil
+	}
+	for _, tc := range []struct {
+		name, proposed string
+		optIn, compare bool
+		keepStream     bool
+		invalid, panic bool
+		wantModels     []string
+	}{
+		{name: "identical bytes", proposed: flow, optIn: true, keepStream: true},
+		{name: "flow to block", proposed: block, optIn: true, compare: true, keepStream: true},
+		{name: "value change", proposed: "models: [alpha, gamma]\n", optIn: true, compare: true, wantModels: []string{"alpha", "gamma"}},
+		{name: "malformed", proposed: "models: [alpha, beta\n", optIn: true, compare: true, invalid: true},
+		{name: "ambiguous", proposed: block + "---\n" + flow, optIn: true, compare: true, invalid: true},
+		{name: "default comparison", proposed: block, wantModels: []string{"alpha", "beta"}},
+		{name: "comparison panic", proposed: block, optIn: true, compare: true, panic: true, wantModels: []string{"alpha", "beta"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newGatedExecutor("unused")
+			e.chunks = make(chan pluginapi.ExecutorStreamChunk, 1)
+			emitted := make(chan string, 2)
+			closed := make(chan *pluginabi.Error, 1)
+			host := CallerFunc(func(_ context.Context, method string, raw []byte) ([]byte, error) {
+				var event struct {
+					Payload []byte           `json:"payload"`
+					Error   *pluginabi.Error `json:"error_detail"`
+				}
+				if err := json.Unmarshal(raw, &event); err != nil {
+					return nil, err
+				}
+				switch method {
+				case pluginabi.MethodHostStreamEmit:
+					emitted <- string(event.Payload)
+				case pluginabi.MethodHostStreamClose:
+					closed <- event.Error
+				}
+				return []byte(`{"ok":true,"result":{}}`), nil
+			})
+			configures, comparisons := 0, 0
+			var applied []string
+			definition := Definition{Metadata: metadata(), Capabilities: gatedCaps(e)}
+			definition.Configure = func(_ context.Context, raw []byte) error {
+				configures++
+				models, err := parse(raw)
+				if err == nil {
+					applied = models
+				}
+				return err
+			}
+			if tc.optIn {
+				definition.ConfigEquivalent = func(previous, proposed []byte) bool {
+					comparisons++
+					// A comparer can modify its copies without changing the baseline
+					// or the bytes that Configure sees on fallback.
+					defer clear(previous)
+					defer clear(proposed)
+					if tc.panic {
+						panic("comparison unavailable")
+					}
+					oldModels, oldErr := parse(previous)
+					newModels, newErr := parse(proposed)
+					return oldErr == nil && newErr == nil && slices.Equal(oldModels, newModels)
+				}
+			}
+			r := newRuntime(t, definition, host)
+			registerWithConfig(t, r, flow)
+			if env := rpc(t, r, pluginabi.MethodExecutorExecuteStream, map[string]any{"stream_id": "equivalent-config"}); !env.OK {
+				t.Fatal(env.Error)
+			}
+			assertEmission := func(marker string) {
+				t.Helper()
+				e.chunks <- pluginapi.ExecutorStreamChunk{Payload: []byte(marker)}
+				select {
+				case got := <-emitted:
+					if got != marker {
+						t.Fatalf("emitted %q, want %q", got, marker)
+					}
+				case detail := <-closed:
+					t.Fatalf("stream closed before emitting %q: %+v", marker, detail)
+				case <-time.After(2 * time.Second):
+					t.Fatalf("stream never emitted %q", marker)
+				}
+			}
+			assertEmission("before reconfigure")
+			env := rpc(t, r, pluginabi.MethodPluginReconfigure, map[string]any{"schema_version": 10, "config_yaml": []byte(tc.proposed)})
+			if tc.invalid {
+				if env.OK || env.Error == nil || env.Error.Code != "invalid_config" {
+					t.Fatalf("invalid reconfigure: %+v", env)
+				}
+			} else if !env.OK {
+				t.Fatalf("reconfigure: %+v", env)
+			}
+			if tc.keepStream {
+				assertEmission("after reconfigure")
+				// The byte-identical check still uses the last applied bytes.
+				if env := rpc(t, r, pluginabi.MethodPluginReconfigure, map[string]any{"schema_version": 10, "config_yaml": []byte(flow)}); !env.OK {
+					t.Fatal(env.Error)
+				}
+				close(e.chunks)
+			}
+			select {
+			case detail := <-closed:
+				if (tc.keepStream && detail != nil) || (!tc.keepStream && (detail == nil || detail.Code != "canceled")) {
+					t.Fatalf("stream terminal error: %+v", detail)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("stream never closed")
+			}
+			wantComparisons, wantConfigures := 0, 2
+			if tc.compare {
+				wantComparisons = 1
+			}
+			if tc.keepStream {
+				wantConfigures = 1
+			}
+			if comparisons != wantComparisons || configures != wantConfigures {
+				t.Fatalf("Configure called %d times, ConfigEquivalent called %d times", configures, comparisons)
+			}
+			if tc.wantModels != nil && !slices.Equal(applied, tc.wantModels) {
+				t.Fatalf("applied models = %v, want %v", applied, tc.wantModels)
+			}
+			if env := rpc(t, r, pluginabi.MethodExecutorIdentifier, nil); env.OK == tc.invalid {
+				t.Fatalf("admission after reconfigure: %+v", env)
+			}
+		})
+	}
+}
+
 func TestChangedReconfigureDrainsInFlightCall(t *testing.T) {
 	e := newGatedExecutor("new-generation")
 	var mu sync.Mutex
